@@ -11,4 +11,6 @@ name = "sattlec"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 logos = "0.15"
+
