@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod codegen;
+pub mod driver;
 pub mod lexer;
 pub mod parser;
 pub mod span;
@@ -9,6 +10,7 @@ pub mod typeck;
 
 pub use ast::{format_ast, Module};
 pub use codegen::{emit_llvm_ir, CodegenError};
+pub use driver::{compile_executable, DriverError};
 pub use lexer::{lex, SpannedToken, Token};
 pub use parser::{parse, ParseError};
 pub use span::{format_tokens, LineIndex};

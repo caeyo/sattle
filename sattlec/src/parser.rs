@@ -118,6 +118,14 @@ impl<'a> Parser<'a> {
                 self.expect(&Token::Semi, "`;`")?;
                 Ok(Stmt::Return(expr))
             }
+            Some(Token::Print) => {
+                self.bump();
+                self.expect(&Token::LParen, "`(`")?;
+                let expr = self.parse_expr()?;
+                self.expect(&Token::RParen, "`)`")?;
+                self.expect(&Token::Semi, "`;`")?;
+                Ok(Stmt::Print(expr))
+            }
             Some(kind) => Err(self.error(format!("expected statement, found {kind}"))),
             None => Err(self.error("expected statement, found end of file")),
         }
@@ -196,7 +204,9 @@ mod tests {
         assert_eq!(func.name, "main");
         assert_eq!(func.return_ty, Type::Name("i32".into()));
         assert_eq!(func.body.stmts.len(), 1);
-        let Stmt::Return(expr) = &func.body.stmts[0];
+        let Stmt::Return(expr) = &func.body.stmts[0] else {
+            panic!("expected return");
+        };
         assert_eq!(
             expr,
             &Expr::Binary {
@@ -211,7 +221,9 @@ mod tests {
     fn addition_is_left_associative() {
         let module = parse_src("fn main() -> i32 { return 1 + 2 + 3; }");
         let Item::Fn(func) = &module.items[0];
-        let Stmt::Return(expr) = &func.body.stmts[0];
+        let Stmt::Return(expr) = &func.body.stmts[0] else {
+            panic!("expected return");
+        };
         assert_eq!(
             expr,
             &Expr::Binary {
@@ -259,5 +271,13 @@ Module
     fn empty_module() {
         let module = parse_src("");
         assert!(module.items.is_empty());
+    }
+
+    #[test]
+    fn parses_print() {
+        let module = parse_src("fn main() -> i32 { print(1 + 1); return 0; }");
+        let Item::Fn(func) = &module.items[0];
+        assert!(matches!(&func.body.stmts[0], Stmt::Print(_)));
+        assert!(matches!(&func.body.stmts[1], Stmt::Return(_)));
     }
 }

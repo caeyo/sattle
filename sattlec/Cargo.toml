@@ -10,6 +10,10 @@ default-run = "sattlec"
 name = "sattlec"
 path = "src/main.rs"
 
+[[test]]
+name = "harness"
+path = "../tests/harness.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 inkwell = { version = "0.10", features = ["llvm22-1"] }

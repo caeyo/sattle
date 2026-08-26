@@ -47,6 +47,8 @@ pub enum Token<'a> {
     Continue,
     #[token("return")]
     Return,
+    #[token("print")]
+    Print,
     #[token("mod")]
     Mod,
     #[token("use")]
@@ -194,6 +196,7 @@ impl fmt::Display for Token<'_> {
             Token::Break => write!(f, "break"),
             Token::Continue => write!(f, "continue"),
             Token::Return => write!(f, "return"),
+            Token::Print => write!(f, "print"),
             Token::Mod => write!(f, "mod"),
             Token::Use => write!(f, "use"),
             Token::Type => write!(f, "type"),

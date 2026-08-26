@@ -58,7 +58,7 @@ fn resolve_type(ty: &Type) -> Result<Ty, TypeError> {
 }
 
 fn check_block(block: &Block, return_ty: Ty) -> Result<(), TypeError> {
-    if block.stmts.is_empty() {
+    if !matches!(block.stmts.last(), Some(Stmt::Return(_))) {
         return Err(TypeError {
             message: "missing `return`".into(),
         });
@@ -80,6 +80,15 @@ fn check_stmt(stmt: &Stmt, return_ty: Ty) -> Result<(), TypeError> {
                         return_ty.name(),
                         ty.name()
                     ),
+                });
+            }
+            Ok(())
+        }
+        Stmt::Print(expr) => {
+            let ty = check_expr(expr)?;
+            if ty != Ty::I32 {
+                return Err(TypeError {
+                    message: format!("`print` requires `i32`, found `{}`", ty.name()),
                 });
             }
             Ok(())
@@ -161,5 +170,10 @@ mod tests {
     fn rejects_i32_overflow_literal() {
         let err = check("fn main() -> i32 { return 9999999999; }").unwrap_err();
         assert!(err.message.contains("i32"), "{}", err.message);
+    }
+
+    #[test]
+    fn accepts_print() {
+        assert!(check("fn main() -> i32 { print(1 + 1); return 0; }").is_ok());
     }
 }

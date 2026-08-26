@@ -33,6 +33,7 @@ pub struct Block {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
     Return(Expr),
+    Print(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +117,11 @@ fn write_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
         Stmt::Return(expr) => {
             indent(out, depth);
             out.push_str("Return\n");
+            write_expr(out, expr, depth + 1);
+        }
+        Stmt::Print(expr) => {
+            indent(out, depth);
+            out.push_str("Print\n");
             write_expr(out, expr, depth + 1);
         }
     }

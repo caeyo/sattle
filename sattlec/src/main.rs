@@ -2,7 +2,7 @@
 
 use clap::{ArgGroup, Parser};
 use sattlec::{
-    emit_llvm_ir, format_ast, format_tokens, lex, parse, typeck, LineIndex,
+    compile_executable, emit_llvm_ir, format_ast, format_tokens, lex, parse, typeck, LineIndex,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use std::process;
 
 #[derive(Debug, Parser)]
 #[command(name = "sattlec", about = "Compiler for the sattle SAT DSL")]
-#[command(group(ArgGroup::new("dump").args(["tokens", "ast", "emit_llvm"])))]
+#[command(group(ArgGroup::new("action").args(["tokens", "ast", "emit_llvm", "output"])))]
 struct Cli {
     /// Dump tokens
     #[arg(long)]
@@ -20,31 +20,16 @@ struct Cli {
     #[arg(long)]
     ast: bool,
 
-    /// Emit LLVM IR (default)
+    /// Emit LLVM IR
     #[arg(long = "emit-llvm")]
     emit_llvm: bool,
 
+    /// Write a native executable (default: a.out)
+    #[arg(short = 'o', value_name = "FILE")]
+    output: Option<PathBuf>,
+
     /// Input `.satl` source file
     input: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DumpMode {
-    Tokens,
-    Ast,
-    EmitLlvm,
-}
-
-impl Cli {
-    fn dump_mode(&self) -> DumpMode {
-        if self.tokens {
-            DumpMode::Tokens
-        } else if self.ast {
-            DumpMode::Ast
-        } else {
-            DumpMode::EmitLlvm
-        }
-    }
 }
 
 fn main() {
@@ -67,8 +52,7 @@ fn main() {
         }
     };
 
-    let mode = cli.dump_mode();
-    if mode == DumpMode::Tokens {
+    if cli.tokens {
         print!("{}", format_tokens(&source, &tokens));
         return;
     }
@@ -81,7 +65,7 @@ fn main() {
         }
     };
 
-    if mode == DumpMode::Ast {
+    if cli.ast {
         print!("{}", format_ast(&module));
         return;
     }
@@ -90,12 +74,24 @@ fn main() {
         report_error(&source, path, None, &err.message);
         process::exit(1);
     }
-    match emit_llvm_ir(&module, &path.display().to_string()) {
-        Ok(ir) => print!("{ir}"),
-        Err(err) => {
-            report_error(&source, path, None, &err.message);
-            process::exit(1);
+
+    let source_name = path.display().to_string();
+    if cli.emit_llvm {
+        match emit_llvm_ir(&module, &source_name) {
+            Ok(ir) => print!("{ir}"),
+            Err(err) => {
+                report_error(&source, path, None, &err.message);
+                process::exit(1);
+            }
         }
+        return;
+    }
+
+    let default_output = PathBuf::from("a.out");
+    let output = cli.output.as_ref().unwrap_or(&default_output);
+    if let Err(err) = compile_executable(&module, &source_name, output) {
+        report_error(&source, path, None, &err.message);
+        process::exit(1);
     }
 }
 
