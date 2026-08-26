@@ -12,5 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+inkwell = { version = "0.10", features = ["llvm22-1"] }
 logos = "0.15"
 

@@ -1,22 +1,28 @@
 //! `sattlec` CLI — compile / inspect `.satl` sources.
 
 use clap::{ArgGroup, Parser};
-use sattlec::{format_ast, format_tokens, lex, parse, LineIndex};
+use sattlec::{
+    emit_llvm_ir, format_ast, format_tokens, lex, parse, typeck, LineIndex,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
 #[derive(Debug, Parser)]
 #[command(name = "sattlec", about = "Compiler for the sattle SAT DSL")]
-#[command(group(ArgGroup::new("dump").args(["tokens", "ast"])))]
+#[command(group(ArgGroup::new("dump").args(["tokens", "ast", "emit_llvm"])))]
 struct Cli {
     /// Dump tokens
     #[arg(long)]
     tokens: bool,
 
-    /// Dump the AST (default)
+    /// Dump the AST
     #[arg(long)]
     ast: bool,
+
+    /// Emit LLVM IR (default)
+    #[arg(long = "emit-llvm")]
+    emit_llvm: bool,
 
     /// Input `.satl` source file
     input: PathBuf,
@@ -26,14 +32,17 @@ struct Cli {
 enum DumpMode {
     Tokens,
     Ast,
+    EmitLlvm,
 }
 
 impl Cli {
     fn dump_mode(&self) -> DumpMode {
         if self.tokens {
             DumpMode::Tokens
-        } else {
+        } else if self.ast {
             DumpMode::Ast
+        } else {
+            DumpMode::EmitLlvm
         }
     }
 }
@@ -53,32 +62,57 @@ fn main() {
     let tokens = match lex(&source) {
         Ok(tokens) => tokens,
         Err(offset) => {
-            report_error(&source, path, offset, "unrecognized token");
+            report_error(&source, path, Some(offset), "unrecognized token");
             process::exit(1);
         }
     };
 
-    match cli.dump_mode() {
-        DumpMode::Tokens => {
-            print!("{}", format_tokens(&source, &tokens));
+    let mode = cli.dump_mode();
+    if mode == DumpMode::Tokens {
+        print!("{}", format_tokens(&source, &tokens));
+        return;
+    }
+
+    let module = match parse(&tokens, source.len()) {
+        Ok(module) => module,
+        Err(err) => {
+            report_error(&source, path, Some(err.offset), &err.message);
+            process::exit(1);
         }
-        DumpMode::Ast => match parse(&tokens, source.len()) {
-            Ok(module) => print!("{}", format_ast(&module)),
-            Err(err) => {
-                report_error(&source, path, err.offset, &err.message);
-                process::exit(1);
-            }
-        },
+    };
+
+    if mode == DumpMode::Ast {
+        print!("{}", format_ast(&module));
+        return;
+    }
+
+    if let Err(err) = typeck(&module) {
+        report_error(&source, path, None, &err.message);
+        process::exit(1);
+    }
+    match emit_llvm_ir(&module, &path.display().to_string()) {
+        Ok(ir) => print!("{ir}"),
+        Err(err) => {
+            report_error(&source, path, None, &err.message);
+            process::exit(1);
+        }
     }
 }
 
-fn report_error(source: &str, path: &Path, offset: usize, message: &str) {
-    let index = LineIndex::new(source);
-    let (line, col) = index.line_col(source, offset);
-    eprintln!(
-        "error: {message} at {}:{}:{}",
-        path.display(),
-        line,
-        col
-    );
+fn report_error(source: &str, path: &Path, offset: Option<usize>, message: &str) {
+    match offset {
+        Some(offset) => {
+            let index = LineIndex::new(source);
+            let (line, col) = index.line_col(source, offset);
+            eprintln!(
+                "error: {message} at {}:{}:{}",
+                path.display(),
+                line,
+                col
+            );
+        }
+        None => {
+            eprintln!("error: {message} ({})", path.display());
+        }
+    }
 }
