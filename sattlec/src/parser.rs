@@ -195,7 +195,35 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_cmp()
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_and()?;
+        while matches!(self.peek_kind(), Some(Token::OrOr)) {
+            self.bump();
+            let rhs = self.parse_and()?;
+            lhs = Expr::Binary {
+                op: BinOp::Or,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_cmp()?;
+        while matches!(self.peek_kind(), Some(Token::AndAnd)) {
+            self.bump();
+            let rhs = self.parse_cmp()?;
+            lhs = Expr::Binary {
+                op: BinOp::And,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, ParseError> {
@@ -270,15 +298,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
-        if matches!(self.peek_kind(), Some(Token::Minus)) {
-            self.bump();
-            let expr = self.parse_unary()?;
-            Ok(Expr::Unary {
-                op: UnOp::Neg,
-                expr: Box::new(expr),
-            })
-        } else {
-            self.parse_operand()
+        match self.peek_kind() {
+            Some(Token::Minus) => {
+                self.bump();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(expr),
+                })
+            }
+            Some(Token::Bang) => {
+                self.bump();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Unary {
+                    op: UnOp::Not,
+                    expr: Box::new(expr),
+                })
+            }
+            _ => self.parse_operand(),
         }
     }
 
@@ -512,6 +549,46 @@ Module
                     rhs: Box::new(Expr::Int(3)),
                 }),
                 rhs: Box::new(Expr::Int(2)),
+            }
+        );
+    }
+
+    fn if_cond(src: &str) -> Expr {
+        let module = parse_src(src);
+        let Item::Fn(func) = &module.items[0];
+        let Stmt::If { cond, .. } = &func.body.stmts[0] else {
+            panic!("expected if");
+        };
+        cond.clone()
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        assert_eq!(
+            if_cond("fn main() -> i32 { if true || false && false { return 1; } return 0; }"),
+            Expr::Binary {
+                op: BinOp::Or,
+                lhs: Box::new(Expr::Bool(true)),
+                rhs: Box::new(Expr::Binary {
+                    op: BinOp::And,
+                    lhs: Box::new(Expr::Bool(false)),
+                    rhs: Box::new(Expr::Bool(false)),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn not_binds_tighter_than_and() {
+        assert_eq!(
+            if_cond("fn main() -> i32 { if !true && false { return 1; } return 0; }"),
+            Expr::Binary {
+                op: BinOp::And,
+                lhs: Box::new(Expr::Unary {
+                    op: UnOp::Not,
+                    expr: Box::new(Expr::Bool(true)),
+                }),
+                rhs: Box::new(Expr::Bool(false)),
             }
         );
     }

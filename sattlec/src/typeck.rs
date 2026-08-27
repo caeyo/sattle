@@ -239,6 +239,14 @@ fn check_expr(expr: &Expr, env: &Env) -> Result<Ty, TypeError> {
                     }
                     Ok(Ty::I32)
                 }
+                UnOp::Not => {
+                    if ty != Ty::Bool {
+                        return Err(TypeError {
+                            message: format!("`!` requires `bool`, found `{}`", ty.name()),
+                        });
+                    }
+                    Ok(Ty::Bool)
+                }
             }
         }
         Expr::Binary { op, lhs, rhs } => {
@@ -274,6 +282,18 @@ fn check_expr(expr: &Expr, env: &Env) -> Result<Ty, TypeError> {
                         return Err(TypeError {
                             message: format!(
                                 "`{op}` requires `i32` operands, found `{}` and `{}`",
+                                lhs_ty.name(),
+                                rhs_ty.name()
+                            ),
+                        });
+                    }
+                    Ok(Ty::Bool)
+                }
+                BinOp::And | BinOp::Or => {
+                    if lhs_ty != Ty::Bool || rhs_ty != Ty::Bool {
+                        return Err(TypeError {
+                            message: format!(
+                                "`{op}` requires `bool` operands, found `{}` and `{}`",
                                 lhs_ty.name(),
                                 rhs_ty.name()
                             ),
@@ -381,5 +401,25 @@ mod tests {
     fn rejects_unary_minus_on_bool() {
         let err = check("fn main() -> i32 { return -true; }").unwrap_err();
         assert!(err.message.contains("i32"), "{}", err.message);
+    }
+
+    #[test]
+    fn accepts_logic() {
+        assert!(check(
+            "fn main() -> i32 { if true && false || !false { return 1; } return 0; }"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_and_on_i32() {
+        let err = check("fn main() -> i32 { if 1 && true { return 0; } return 1; }").unwrap_err();
+        assert!(err.message.contains("bool"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_not_on_i32() {
+        let err = check("fn main() -> i32 { if !1 { return 0; } return 1; }").unwrap_err();
+        assert!(err.message.contains("bool"), "{}", err.message);
     }
 }

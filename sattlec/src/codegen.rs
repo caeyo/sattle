@@ -410,8 +410,16 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                             message: format!("failed to build neg: {e}"),
                         })
                     }
+                    UnOp::Not => self.builder.build_not(value, "not").map_err(|e| CodegenError {
+                        message: format!("failed to build not: {e}"),
+                    }),
                 }
             }
+            Expr::Binary {
+                op: op @ (BinOp::And | BinOp::Or),
+                lhs,
+                rhs,
+            } => self.codegen_short_circuit(*op, lhs, rhs),
             Expr::Binary { op, lhs, rhs } => {
                 let lhs = self.codegen_expr(lhs)?;
                 let rhs = self.codegen_expr(rhs)?;
@@ -450,9 +458,75 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                                 message: format!("failed to build compare: {e}"),
                             })
                     }
+                    BinOp::And | BinOp::Or => unreachable!("short-circuit ops are handled above"),
                 }
             }
         }
+    }
+
+    fn codegen_short_circuit(
+        &self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Result<IntValue<'ctx>, CodegenError> {
+        let (prefix, short_on_true) = match op {
+            BinOp::And => ("and", false),
+            BinOp::Or => ("or", true),
+            _ => unreachable!("not a short-circuit op"),
+        };
+
+        let lhs_val = self.codegen_expr(lhs)?;
+        let rhs_bb = self
+            .context
+            .append_basic_block(self.llvm_fn, &format!("{prefix}.rhs"));
+        let short_bb = self
+            .context
+            .append_basic_block(self.llvm_fn, &format!("{prefix}.short"));
+        let merge_bb = self
+            .context
+            .append_basic_block(self.llvm_fn, &format!("{prefix}.merge"));
+
+        let (true_bb, false_bb) = if short_on_true {
+            (short_bb, rhs_bb)
+        } else {
+            (rhs_bb, short_bb)
+        };
+        self.builder
+            .build_conditional_branch(lhs_val, true_bb, false_bb)
+            .map_err(|e| CodegenError {
+                message: format!("failed to build `{op}`: {e}"),
+            })?;
+
+        self.builder.position_at_end(rhs_bb);
+        let rhs_val = self.codegen_expr(rhs)?;
+        let rhs_end = self.builder.get_insert_block().unwrap_or(rhs_bb);
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| CodegenError {
+                message: format!("failed to leave `{op}` rhs: {e}"),
+            })?;
+
+        self.builder.position_at_end(short_bb);
+        let short_val = self
+            .context
+            .bool_type()
+            .const_int(u64::from(short_on_true), false);
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| CodegenError {
+                message: format!("failed to leave `{op}` short: {e}"),
+            })?;
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self
+            .builder
+            .build_phi(self.context.bool_type(), prefix)
+            .map_err(|e| CodegenError {
+                message: format!("failed to build `{op}` phi: {e}"),
+            })?;
+        phi.add_incoming(&[(&rhs_val, rhs_end), (&short_val, short_bb)]);
+        Ok(phi.as_basic_value().into_int_value())
     }
 }
 
@@ -464,8 +538,8 @@ fn int_pred(op: BinOp) -> IntPredicate {
         BinOp::Le => IntPredicate::SLE,
         BinOp::Gt => IntPredicate::SGT,
         BinOp::Ge => IntPredicate::SGE,
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-            unreachable!("arithmetic is not a compare")
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::And | BinOp::Or => {
+            unreachable!("not a compare")
         }
     }
 }
@@ -529,5 +603,14 @@ mod tests {
         let module = module_of("fn add() -> i32 { return 1; }");
         let err = emit_llvm_ir(&module, "add.satl").unwrap_err();
         assert!(err.message.contains("add"), "{}", err.message);
+    }
+
+    #[test]
+    fn emit_llvm_short_circuits_and() {
+        let module = module_of("fn main() -> i32 { if false && true { return 1; } return 0; }");
+        let ir = emit_llvm_ir(&module, "logic.satl").unwrap();
+        assert!(ir.contains("and.rhs"), "{ir}");
+        assert!(ir.contains("and.merge"), "{ir}");
+        assert!(ir.contains("phi"), "{ir}");
     }
 }
