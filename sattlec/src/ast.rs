@@ -34,11 +34,31 @@ pub struct Block {
 pub enum Stmt {
     Return(Expr),
     Print(Expr),
+    Let {
+        name: String,
+        ty: Option<Type>,
+        value: Expr,
+    },
+    Assign {
+        name: String,
+        value: Expr,
+    },
+    If {
+        cond: Expr,
+        then_block: Block,
+        else_block: Option<Block>,
+    },
+    While {
+        cond: Expr,
+        body: Block,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
     Int(i64),
+    Bool(bool),
+    Var(String),
     Binary {
         op: BinOp,
         lhs: Box<Expr>,
@@ -49,12 +69,24 @@ pub enum Expr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 impl fmt::Display for BinOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BinOp::Add => write!(f, "+"),
+            BinOp::Eq => write!(f, "=="),
+            BinOp::Ne => write!(f, "!="),
+            BinOp::Lt => write!(f, "<"),
+            BinOp::Le => write!(f, "<="),
+            BinOp::Gt => write!(f, ">"),
+            BinOp::Ge => write!(f, ">="),
         }
     }
 }
@@ -124,6 +156,50 @@ fn write_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             out.push_str("Print\n");
             write_expr(out, expr, depth + 1);
         }
+        Stmt::Let { name, ty, value } => {
+            indent(out, depth);
+            out.push_str(&format!("Let {name}\n"));
+            if let Some(ty) = ty {
+                indent(out, depth + 1);
+                out.push_str("Type\n");
+                write_type(out, ty, depth + 2);
+            }
+            write_expr(out, value, depth + 1);
+        }
+        Stmt::Assign { name, value } => {
+            indent(out, depth);
+            out.push_str(&format!("Assign {name}\n"));
+            write_expr(out, value, depth + 1);
+        }
+        Stmt::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            indent(out, depth);
+            out.push_str("If\n");
+            indent(out, depth + 1);
+            out.push_str("Cond\n");
+            write_expr(out, cond, depth + 2);
+            indent(out, depth + 1);
+            out.push_str("Then\n");
+            write_block(out, then_block, depth + 2);
+            if let Some(else_block) = else_block {
+                indent(out, depth + 1);
+                out.push_str("Else\n");
+                write_block(out, else_block, depth + 2);
+            }
+        }
+        Stmt::While { cond, body } => {
+            indent(out, depth);
+            out.push_str("While\n");
+            indent(out, depth + 1);
+            out.push_str("Cond\n");
+            write_expr(out, cond, depth + 2);
+            indent(out, depth + 1);
+            out.push_str("Body\n");
+            write_block(out, body, depth + 2);
+        }
     }
 }
 
@@ -131,6 +207,8 @@ fn write_expr(out: &mut String, expr: &Expr, depth: usize) {
     indent(out, depth);
     match expr {
         Expr::Int(n) => out.push_str(&format!("Int({n})\n")),
+        Expr::Bool(b) => out.push_str(&format!("Bool({b})\n")),
+        Expr::Var(name) => out.push_str(&format!("Var({name})\n")),
         Expr::Binary { op, lhs, rhs } => {
             out.push_str(&format!("Binary({op})\n"));
             write_expr(out, lhs, depth + 1);

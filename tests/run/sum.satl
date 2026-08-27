@@ -1,0 +1,15 @@
+fn main() -> i32 {
+    let n = 3;
+    let i = 0;
+    let sum = 0;
+    while i < n {
+        sum = sum + i;
+        i = i + 1;
+    }
+    if sum == 3 {
+        print(sum);
+    } else {
+        print(0);
+    }
+    return 0;
+}

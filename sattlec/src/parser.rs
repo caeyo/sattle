@@ -34,6 +34,10 @@ impl<'a> Parser<'a> {
         self.peek().map(|t| &t.kind)
     }
 
+    fn peek_nth_kind(&self, n: usize) -> Option<&Token<'a>> {
+        self.tokens.get(self.pos + n).map(|t| &t.kind)
+    }
+
     fn current_offset(&self) -> usize {
         self.peek()
             .map(|t| t.span.start)
@@ -126,13 +130,98 @@ impl<'a> Parser<'a> {
                 self.expect(&Token::Semi, "`;`")?;
                 Ok(Stmt::Print(expr))
             }
+            Some(Token::Let) => self.parse_let(),
+            Some(Token::If) => self.parse_if(),
+            Some(Token::While) => self.parse_while(),
+            Some(Token::Ident(_)) if matches!(self.peek_nth_kind(1), Some(Token::Eq)) => {
+                self.parse_assign()
+            }
             Some(kind) => Err(self.error(format!("expected statement, found {kind}"))),
             None => Err(self.error("expected statement, found end of file")),
         }
     }
 
+    fn parse_let(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&Token::Let, "`let`")?;
+        let name = self.expect_ident("variable name")?;
+        let ty = if matches!(self.peek_kind(), Some(Token::Colon)) {
+            self.bump();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&Token::Eq, "`=`")?;
+        let value = self.parse_expr()?;
+        self.expect(&Token::Semi, "`;`")?;
+        Ok(Stmt::Let { name, ty, value })
+    }
+
+    fn parse_assign(&mut self) -> Result<Stmt, ParseError> {
+        let name = self.expect_ident("variable name")?;
+        self.expect(&Token::Eq, "`=`")?;
+        let value = self.parse_expr()?;
+        self.expect(&Token::Semi, "`;`")?;
+        Ok(Stmt::Assign { name, value })
+    }
+
+    fn parse_if(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&Token::If, "`if`")?;
+        let cond = self.parse_expr()?;
+        let then_block = self.parse_block()?;
+        let else_block = if matches!(self.peek_kind(), Some(Token::Else)) {
+            self.bump();
+            if matches!(self.peek_kind(), Some(Token::If)) {
+                Some(Block {
+                    stmts: vec![self.parse_if()?],
+                })
+            } else {
+                Some(self.parse_block()?)
+            }
+        } else {
+            None
+        };
+        Ok(Stmt::If {
+            cond,
+            then_block,
+            else_block,
+        })
+    }
+
+    fn parse_while(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&Token::While, "`while`")?;
+        let cond = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(Stmt::While { cond, body })
+    }
+
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_add()
+        self.parse_cmp()
+    }
+
+    fn parse_cmp(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_add()?;
+        while let Some(op) = self.peek_cmp_op() {
+            self.bump();
+            let rhs = self.parse_add()?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn peek_cmp_op(&self) -> Option<BinOp> {
+        match self.peek_kind() {
+            Some(Token::EqEq) => Some(BinOp::Eq),
+            Some(Token::NotEq) => Some(BinOp::Ne),
+            Some(Token::Lt) => Some(BinOp::Lt),
+            Some(Token::Le) => Some(BinOp::Le),
+            Some(Token::Gt) => Some(BinOp::Gt),
+            Some(Token::Ge) => Some(BinOp::Ge),
+            _ => None,
+        }
     }
 
     fn parse_add(&mut self) -> Result<Expr, ParseError> {
@@ -160,6 +249,25 @@ impl<'a> Parser<'a> {
                     offset,
                 })?;
                 Ok(Expr::Int(value))
+            }
+            Some(Token::True) => {
+                self.bump();
+                Ok(Expr::Bool(true))
+            }
+            Some(Token::False) => {
+                self.bump();
+                Ok(Expr::Bool(false))
+            }
+            Some(Token::Ident(name)) => {
+                let name = (*name).to_string();
+                self.bump();
+                Ok(Expr::Var(name))
+            }
+            Some(Token::LParen) => {
+                self.bump();
+                let expr = self.parse_expr()?;
+                self.expect(&Token::RParen, "`)`")?;
+                Ok(expr)
             }
             Some(kind) => Err(self.error(format!("expected expression, found {kind}"))),
             None => Err(self.error("expected expression, found end of file")),
@@ -279,5 +387,16 @@ Module
         let Item::Fn(func) = &module.items[0];
         assert!(matches!(&func.body.stmts[0], Stmt::Print(_)));
         assert!(matches!(&func.body.stmts[1], Stmt::Return(_)));
+    }
+
+    #[test]
+    fn parses_let_if_while() {
+        let module = parse_src(
+            "fn main() -> i32 {\n    let i = 0;\n    while i < 3 { i = i + 1; }\n    if i == 3 { return 1; } else { return 0; }\n}",
+        );
+        let Item::Fn(func) = &module.items[0];
+        assert!(matches!(&func.body.stmts[0], Stmt::Let { name, .. } if name == "i"));
+        assert!(matches!(&func.body.stmts[1], Stmt::While { .. }));
+        assert!(matches!(&func.body.stmts[2], Stmt::If { .. }));
     }
 }
