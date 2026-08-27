@@ -59,6 +59,10 @@ pub enum Expr {
     Int(i64),
     Bool(bool),
     Var(String),
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+    },
     Binary {
         op: BinOp,
         lhs: Box<Expr>,
@@ -67,8 +71,25 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnOp {
+    Neg,
+}
+
+impl fmt::Display for UnOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UnOp::Neg => write!(f, "-"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
     Eq,
     Ne,
     Lt,
@@ -81,6 +102,10 @@ impl fmt::Display for BinOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BinOp::Add => write!(f, "+"),
+            BinOp::Sub => write!(f, "-"),
+            BinOp::Mul => write!(f, "*"),
+            BinOp::Div => write!(f, "/"),
+            BinOp::Rem => write!(f, "%"),
             BinOp::Eq => write!(f, "=="),
             BinOp::Ne => write!(f, "!="),
             BinOp::Lt => write!(f, "<"),
@@ -209,6 +234,10 @@ fn write_expr(out: &mut String, expr: &Expr, depth: usize) {
         Expr::Int(n) => out.push_str(&format!("Int({n})\n")),
         Expr::Bool(b) => out.push_str(&format!("Bool({b})\n")),
         Expr::Var(name) => out.push_str(&format!("Var({name})\n")),
+        Expr::Unary { op, expr } => {
+            out.push_str(&format!("Unary({op})\n"));
+            write_expr(out, expr, depth + 1);
+        }
         Expr::Binary { op, lhs, rhs } => {
             out.push_str(&format!("Binary({op})\n"));
             write_expr(out, lhs, depth + 1);

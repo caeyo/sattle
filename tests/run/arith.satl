@@ -1,0 +1,9 @@
+fn main() -> i32 {
+    print(1 + 2 * 3);
+    print(10 - 3 - 2);
+    print(8 / 2 * 2);
+    print(7 % 4);
+    print(-2 * 3);
+    print(-(1 + 2));
+    return 0;
+}

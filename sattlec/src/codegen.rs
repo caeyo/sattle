@@ -1,6 +1,6 @@
 //! LLVM code generation via inkwell.
 
-use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt};
+use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt, UnOp};
 use crate::typeck::Ty;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
@@ -402,6 +402,16 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let var = self.lookup(name)?;
                 self.load(var, name)
             }
+            Expr::Unary { op, expr } => {
+                let value = self.codegen_expr(expr)?;
+                match op {
+                    UnOp::Neg => {
+                        self.builder.build_int_neg(value, "neg").map_err(|e| CodegenError {
+                            message: format!("failed to build neg: {e}"),
+                        })
+                    }
+                }
+            }
             Expr::Binary { op, lhs, rhs } => {
                 let lhs = self.codegen_expr(lhs)?;
                 let rhs = self.codegen_expr(rhs)?;
@@ -411,6 +421,28 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                             message: format!("failed to build add: {e}"),
                         }
                     }),
+                    BinOp::Sub => self.builder.build_int_sub(lhs, rhs, "sub").map_err(|e| {
+                        CodegenError {
+                            message: format!("failed to build sub: {e}"),
+                        }
+                    }),
+                    BinOp::Mul => self.builder.build_int_mul(lhs, rhs, "mul").map_err(|e| {
+                        CodegenError {
+                            message: format!("failed to build mul: {e}"),
+                        }
+                    }),
+                    BinOp::Div => self
+                        .builder
+                        .build_int_signed_div(lhs, rhs, "div")
+                        .map_err(|e| CodegenError {
+                            message: format!("failed to build div: {e}"),
+                        }),
+                    BinOp::Rem => self
+                        .builder
+                        .build_int_signed_rem(lhs, rhs, "rem")
+                        .map_err(|e| CodegenError {
+                            message: format!("failed to build rem: {e}"),
+                        }),
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         self.builder
                             .build_int_compare(int_pred(*op), lhs, rhs, "cmp")
@@ -432,7 +464,9 @@ fn int_pred(op: BinOp) -> IntPredicate {
         BinOp::Le => IntPredicate::SLE,
         BinOp::Gt => IntPredicate::SGT,
         BinOp::Ge => IntPredicate::SGE,
-        BinOp::Add => unreachable!("add is not a compare"),
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+            unreachable!("arithmetic is not a compare")
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 //! Type checking.
 
-use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt, Type};
+use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt, Type, UnOp};
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -228,15 +228,28 @@ fn check_expr(expr: &Expr, env: &Env) -> Result<Ty, TypeError> {
         Expr::Var(name) => env.get(name).ok_or_else(|| TypeError {
             message: format!("undeclared variable `{name}`"),
         }),
+        Expr::Unary { op, expr } => {
+            let ty = check_expr(expr, env)?;
+            match op {
+                UnOp::Neg => {
+                    if ty != Ty::I32 {
+                        return Err(TypeError {
+                            message: format!("`-` requires `i32`, found `{}`", ty.name()),
+                        });
+                    }
+                    Ok(Ty::I32)
+                }
+            }
+        }
         Expr::Binary { op, lhs, rhs } => {
             let lhs_ty = check_expr(lhs, env)?;
             let rhs_ty = check_expr(rhs, env)?;
             match op {
-                BinOp::Add => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                     if lhs_ty != Ty::I32 || rhs_ty != Ty::I32 {
                         return Err(TypeError {
                             message: format!(
-                                "`+` requires `i32` operands, found `{}` and `{}`",
+                                "`{op}` requires `i32` operands, found `{}` and `{}`",
                                 lhs_ty.name(),
                                 rhs_ty.name()
                             ),
@@ -351,5 +364,22 @@ mod tests {
     #[test]
     fn ignores_dead_code_after_return() {
         assert!(check("fn main() -> i32 { return 0; print(true); if 1 { return x; } }").is_ok());
+    }
+
+    #[test]
+    fn accepts_integer_arithmetic() {
+        assert!(check("fn main() -> i32 { return -1 + 2 * 3 - 8 / 2 % 3; }").is_ok());
+    }
+
+    #[test]
+    fn rejects_bool_arithmetic() {
+        let err = check("fn main() -> i32 { return true * 1; }").unwrap_err();
+        assert!(err.message.contains("i32"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_unary_minus_on_bool() {
+        let err = check("fn main() -> i32 { return -true; }").unwrap_err();
+        assert!(err.message.contains("i32"), "{}", err.message);
     }
 }

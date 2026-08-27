@@ -1,6 +1,6 @@
 //! Recursive-descent parser.
 
-use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt, Type};
+use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt, Type, UnOp};
 use crate::lexer::{SpannedToken, Token};
 
 /// Parse error: message and byte offset into the source.
@@ -225,17 +225,61 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_add(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_operand()?;
-        while matches!(self.peek_kind(), Some(Token::Plus)) {
+        let mut lhs = self.parse_mul()?;
+        while let Some(op) = self.peek_add_op() {
             self.bump();
-            let rhs = self.parse_operand()?;
+            let rhs = self.parse_mul()?;
             lhs = Expr::Binary {
-                op: BinOp::Add,
+                op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
         }
         Ok(lhs)
+    }
+
+    fn peek_add_op(&self) -> Option<BinOp> {
+        match self.peek_kind() {
+            Some(Token::Plus) => Some(BinOp::Add),
+            Some(Token::Minus) => Some(BinOp::Sub),
+            _ => None,
+        }
+    }
+
+    fn parse_mul(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_unary()?;
+        while let Some(op) = self.peek_mul_op() {
+            self.bump();
+            let rhs = self.parse_unary()?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn peek_mul_op(&self) -> Option<BinOp> {
+        match self.peek_kind() {
+            Some(Token::Star) => Some(BinOp::Mul),
+            Some(Token::Slash) => Some(BinOp::Div),
+            Some(Token::Percent) => Some(BinOp::Rem),
+            _ => None,
+        }
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        if matches!(self.peek_kind(), Some(Token::Minus)) {
+            self.bump();
+            let expr = self.parse_unary()?;
+            Ok(Expr::Unary {
+                op: UnOp::Neg,
+                expr: Box::new(expr),
+            })
+        } else {
+            self.parse_operand()
+        }
     }
 
     fn parse_operand(&mut self) -> Result<Expr, ParseError> {
@@ -296,7 +340,7 @@ pub fn parse(tokens: &[SpannedToken<'_>], source_len: usize) -> Result<Module, P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{format_ast, BinOp, Expr, Item, Stmt};
+    use crate::ast::{format_ast, BinOp, Expr, Item, Stmt, UnOp};
     use crate::lexer::lex;
 
     fn parse_src(src: &str) -> Module {
@@ -398,5 +442,77 @@ Module
         assert!(matches!(&func.body.stmts[0], Stmt::Let { name, .. } if name == "i"));
         assert!(matches!(&func.body.stmts[1], Stmt::While { .. }));
         assert!(matches!(&func.body.stmts[2], Stmt::If { .. }));
+    }
+
+    fn return_expr(src: &str) -> Expr {
+        let module = parse_src(src);
+        let Item::Fn(func) = &module.items[0];
+        let Stmt::Return(expr) = &func.body.stmts[0] else {
+            panic!("expected return");
+        };
+        expr.clone()
+    }
+
+    #[test]
+    fn mul_binds_tighter_than_add() {
+        assert_eq!(
+            return_expr("fn main() -> i32 { return 1 + 2 * 3; }"),
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Int(1)),
+                rhs: Box::new(Expr::Binary {
+                    op: BinOp::Mul,
+                    lhs: Box::new(Expr::Int(2)),
+                    rhs: Box::new(Expr::Int(3)),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn unary_minus_binds_tighter_than_mul() {
+        assert_eq!(
+            return_expr("fn main() -> i32 { return -2 * 3; }"),
+            Expr::Binary {
+                op: BinOp::Mul,
+                lhs: Box::new(Expr::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(Expr::Int(2)),
+                }),
+                rhs: Box::new(Expr::Int(3)),
+            }
+        );
+    }
+
+    #[test]
+    fn mul_div_are_left_associative() {
+        assert_eq!(
+            return_expr("fn main() -> i32 { return 8 / 2 * 2; }"),
+            Expr::Binary {
+                op: BinOp::Mul,
+                lhs: Box::new(Expr::Binary {
+                    op: BinOp::Div,
+                    lhs: Box::new(Expr::Int(8)),
+                    rhs: Box::new(Expr::Int(2)),
+                }),
+                rhs: Box::new(Expr::Int(2)),
+            }
+        );
+    }
+
+    #[test]
+    fn sub_is_left_associative() {
+        assert_eq!(
+            return_expr("fn main() -> i32 { return 10 - 3 - 2; }"),
+            Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Binary {
+                    op: BinOp::Sub,
+                    lhs: Box::new(Expr::Int(10)),
+                    rhs: Box::new(Expr::Int(3)),
+                }),
+                rhs: Box::new(Expr::Int(2)),
+            }
+        );
     }
 }
