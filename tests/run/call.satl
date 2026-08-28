@@ -1,0 +1,16 @@
+fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+fn sum(n: i32) -> i32 {
+    if n <= 0 {
+        return 0;
+    }
+    return n + sum(n - 1);
+}
+
+fn main() -> i32 {
+    print(add(2, 3));
+    print(sum(3));
+    return 0;
+}

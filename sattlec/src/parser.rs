@@ -1,6 +1,6 @@
 //! Recursive-descent parser.
 
-use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt, Type, UnOp};
+use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Param, Stmt, Type, UnOp};
 use crate::lexer::{SpannedToken, Token};
 
 /// Parse error: message and byte offset into the source.
@@ -88,16 +88,36 @@ impl<'a> Parser<'a> {
     fn parse_function(&mut self) -> Result<Function, ParseError> {
         self.expect(&Token::Fn, "`fn`")?;
         let name = self.expect_ident("function name")?;
-        self.expect(&Token::LParen, "`(`")?;
-        self.expect(&Token::RParen, "`)`")?;
+        let params = self.parse_params()?;
         self.expect(&Token::Arrow, "`->`")?;
         let return_ty = self.parse_type()?;
         let body = self.parse_block()?;
         Ok(Function {
             name,
+            params,
             return_ty,
             body,
         })
+    }
+
+    fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
+        self.expect(&Token::LParen, "`(`")?;
+        let mut params = Vec::new();
+        if !matches!(self.peek_kind(), Some(Token::RParen)) {
+            loop {
+                let name = self.expect_ident("parameter name")?;
+                self.expect(&Token::Colon, "`:`")?;
+                let ty = self.parse_type()?;
+                params.push(Param { name, ty });
+                if matches!(self.peek_kind(), Some(Token::Comma)) {
+                    self.bump();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(params)
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
@@ -369,7 +389,12 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(name)) => {
                 let name = (*name).to_string();
                 self.bump();
-                Ok(Expr::Var(name))
+                if matches!(self.peek_kind(), Some(Token::LParen)) {
+                    let args = self.parse_arg_list()?;
+                    Ok(Expr::Call { name, args })
+                } else {
+                    Ok(Expr::Var(name))
+                }
             }
             Some(Token::LParen) => {
                 self.bump();
@@ -380,6 +405,23 @@ impl<'a> Parser<'a> {
             Some(kind) => Err(self.error(format!("expected expression, found {kind}"))),
             None => Err(self.error("expected expression, found end of file")),
         }
+    }
+
+    fn parse_arg_list(&mut self) -> Result<Vec<Expr>, ParseError> {
+        self.expect(&Token::LParen, "`(`")?;
+        let mut args = Vec::new();
+        if !matches!(self.peek_kind(), Some(Token::RParen)) {
+            loop {
+                args.push(self.parse_expr()?);
+                if matches!(self.peek_kind(), Some(Token::Comma)) {
+                    self.bump();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(args)
     }
 
     fn expect_ident(&mut self, label: &str) -> Result<String, ParseError> {
@@ -519,6 +561,24 @@ Module
             panic!("expected for");
         };
         assert!(matches!(&body.stmts[1], Stmt::Break));
+    }
+
+    #[test]
+    fn parses_params_and_call() {
+        let module = parse_src(
+            "fn add(a: i32, b: i32) -> i32 { return a + b; } fn main() -> i32 { return add(1, 2); }",
+        );
+        assert_eq!(module.items.len(), 2);
+        let Item::Fn(add) = &module.items[0];
+        assert_eq!(add.params.len(), 2);
+        assert_eq!(add.params[0].name, "a");
+        assert_eq!(
+            return_expr("fn main() -> i32 { return add(1, 2); }"),
+            Expr::Call {
+                name: "add".into(),
+                args: vec![Expr::Int(1), Expr::Int(2)],
+            }
+        );
     }
 
     fn return_expr(src: &str) -> Expr {

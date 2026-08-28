@@ -1,6 +1,6 @@
 //! LLVM code generation via inkwell.
 
-use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt, UnOp};
+use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt, Type, UnOp};
 use crate::typeck::Ty;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
@@ -103,18 +103,17 @@ fn build_module<'ctx>(
     llvm_module.set_source_file_name(source_name);
     declare_runtime(context, &llvm_module);
     let builder = context.create_builder();
-    let mut saw_main = false;
 
+    let mut functions = HashMap::new();
+    let mut saw_main = false;
     for item in &module.items {
         match item {
-            Item::Fn(func) if func.name == "main" => {
-                codegen_main(context, &llvm_module, &builder, func)?;
-                saw_main = true;
-            }
             Item::Fn(func) => {
-                return Err(CodegenError {
-                    message: format!("codegen: unsupported function `{}`", func.name),
-                });
+                if func.name == "main" {
+                    saw_main = true;
+                }
+                let llvm_fn = declare_function(context, &llvm_module, func);
+                functions.insert(func.name.clone(), llvm_fn);
             }
         }
     }
@@ -123,6 +122,14 @@ fn build_module<'ctx>(
         return Err(CodegenError {
             message: "`main` function not found".into(),
         });
+    }
+
+    for item in &module.items {
+        match item {
+            Item::Fn(func) => {
+                codegen_function(context, &llvm_module, &builder, &functions, func)?;
+            }
+        }
     }
 
     llvm_module.verify().map_err(|e| CodegenError {
@@ -139,15 +146,33 @@ fn declare_runtime<'ctx>(context: &'ctx Context, llvm_module: &LlvmModule<'ctx>)
     llvm_module.add_function(PRINT_I32, ty, None);
 }
 
-fn codegen_main<'ctx>(
+fn declare_function<'ctx>(
+    context: &'ctx Context,
+    llvm_module: &LlvmModule<'ctx>,
+    func: &Function,
+) -> FunctionValue<'ctx> {
+    let ret = llvm_int_ty(context, ast_ty(&func.return_ty));
+    let params: Vec<_> = func
+        .params
+        .iter()
+        .map(|param| llvm_int_ty(context, ast_ty(&param.ty)).into())
+        .collect();
+    let fn_ty = ret.fn_type(&params, false);
+    let llvm_fn = llvm_module.add_function(&func.name, fn_ty, None);
+    for (i, param) in func.params.iter().enumerate() {
+        llvm_fn.get_nth_param(i as u32).unwrap().set_name(&param.name);
+    }
+    llvm_fn
+}
+
+fn codegen_function<'ctx>(
     context: &'ctx Context,
     llvm_module: &LlvmModule<'ctx>,
     builder: &Builder<'ctx>,
+    functions: &HashMap<String, FunctionValue<'ctx>>,
     func: &Function,
 ) -> Result<(), CodegenError> {
-    let i32_ty = context.i32_type();
-    let fn_ty = i32_ty.fn_type(&[], false);
-    let llvm_fn = llvm_module.add_function("main", fn_ty, None);
+    let llvm_fn = functions[&func.name];
     let entry = context.append_basic_block(llvm_fn, "entry");
     builder.position_at_end(entry);
     let mut cg = Codegen {
@@ -155,10 +180,22 @@ fn codegen_main<'ctx>(
         llvm_module,
         builder,
         llvm_fn,
+        functions,
         scopes: Vec::new(),
         loops: Vec::new(),
     };
+    cg.push_scope();
+    for (i, param) in func.params.iter().enumerate() {
+        let ty = ast_ty(&param.ty);
+        let val = llvm_fn.get_nth_param(i as u32).unwrap().into_int_value();
+        let ptr = cg.alloca(ty, &param.name)?;
+        cg.builder.build_store(ptr, val).map_err(|e| CodegenError {
+            message: format!("failed to store `{}`: {e}", param.name),
+        })?;
+        cg.declare(&param.name, Var { ptr, ty });
+    }
     cg.codegen_block(&func.body)?;
+    cg.pop_scope();
     if !cg.terminated() {
         return Err(CodegenError {
             message: "missing `return`".into(),
@@ -182,6 +219,7 @@ struct Codegen<'ctx, 'a> {
     llvm_module: &'a LlvmModule<'ctx>,
     builder: &'a Builder<'ctx>,
     llvm_fn: FunctionValue<'ctx>,
+    functions: &'a HashMap<String, FunctionValue<'ctx>>,
     scopes: Vec<HashMap<String, Var<'ctx>>>,
     loops: Vec<Loop<'ctx>>,
 }
@@ -220,10 +258,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 
     fn llvm_ty(&self, ty: Ty) -> inkwell::types::IntType<'ctx> {
-        match ty {
-            Ty::I32 => self.context.i32_type(),
-            Ty::Bool => self.context.bool_type(),
-        }
+        llvm_int_ty(self.context, ty)
     }
 
     fn alloca(&self, ty: Ty, name: &str) -> Result<PointerValue<'ctx>, CodegenError> {
@@ -535,6 +570,20 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 let var = self.lookup(name)?;
                 self.load(var, name)
             }
+            Expr::Call { name, args } => {
+                let callee = *self.functions.get(name).unwrap();
+                let mut compiled = Vec::new();
+                for arg in args {
+                    compiled.push(self.codegen_expr(arg)?.into());
+                }
+                let call = self
+                    .builder
+                    .build_call(callee, &compiled, "call")
+                    .map_err(|e| CodegenError {
+                        message: format!("failed to call `{name}`: {e}"),
+                    })?;
+                Ok(call.try_as_basic_value().basic().unwrap().into_int_value())
+            }
             Expr::Unary { op, expr } => {
                 let value = self.codegen_expr(expr)?;
                 match op {
@@ -663,6 +712,21 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 }
 
+fn llvm_int_ty<'ctx>(context: &'ctx Context, ty: Ty) -> inkwell::types::IntType<'ctx> {
+    match ty {
+        Ty::I32 => context.i32_type(),
+        Ty::Bool => context.bool_type(),
+    }
+}
+
+fn ast_ty(ty: &Type) -> Ty {
+    match ty {
+        Type::Name(name) if name == "i32" => Ty::I32,
+        Type::Name(name) if name == "bool" => Ty::Bool,
+        Type::Name(_) => unreachable!("typeck rejects unknown types"),
+    }
+}
+
 fn int_pred(op: BinOp) -> IntPredicate {
     match op {
         BinOp::Eq => IntPredicate::EQ,
@@ -732,10 +796,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_main_function() {
-        let module = module_of("fn add() -> i32 { return 1; }");
-        let err = emit_llvm_ir(&module, "add.satl").unwrap_err();
-        assert!(err.message.contains("add"), "{}", err.message);
+    fn emit_llvm_includes_callee() {
+        let module = module_of(
+            "fn add(a: i32, b: i32) -> i32 { return a + b; } fn main() -> i32 { return add(1, 2); }",
+        );
+        let ir = emit_llvm_ir(&module, "call.satl").unwrap();
+        assert!(ir.contains("define i32 @add"), "{ir}");
+        assert!(ir.contains("call i32 @add"), "{ir}");
     }
 
     #[test]

@@ -16,8 +16,15 @@ pub enum Item {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Function {
     pub name: String,
+    pub params: Vec<Param>,
     pub return_ty: Type,
     pub body: Block,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    pub name: String,
+    pub ty: Type,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +74,10 @@ pub enum Expr {
     Int(i64),
     Bool(bool),
     Var(String),
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
     Unary {
         op: UnOp,
         expr: Box<Expr>,
@@ -160,6 +171,15 @@ fn write_item(out: &mut String, item: &Item, depth: usize) {
 fn write_function(out: &mut String, func: &Function, depth: usize) {
     indent(out, depth);
     out.push_str(&format!("Fn {}\n", func.name));
+    if !func.params.is_empty() {
+        indent(out, depth + 1);
+        out.push_str("Params\n");
+        for param in &func.params {
+            indent(out, depth + 2);
+            out.push_str(&format!("{}\n", param.name));
+            write_type(out, &param.ty, depth + 3);
+        }
+    }
     indent(out, depth + 1);
     out.push_str("ReturnType\n");
     write_type(out, &func.return_ty, depth + 2);
@@ -274,6 +294,12 @@ fn write_expr(out: &mut String, expr: &Expr, depth: usize) {
         Expr::Int(n) => out.push_str(&format!("Int({n})\n")),
         Expr::Bool(b) => out.push_str(&format!("Bool({b})\n")),
         Expr::Var(name) => out.push_str(&format!("Var({name})\n")),
+        Expr::Call { name, args } => {
+            out.push_str(&format!("Call {name}\n"));
+            for arg in args {
+                write_expr(out, arg, depth + 1);
+            }
+        }
         Expr::Unary { op, expr } => {
             out.push_str(&format!("Unary({op})\n"));
             write_expr(out, expr, depth + 1);
