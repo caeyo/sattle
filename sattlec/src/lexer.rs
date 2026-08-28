@@ -41,6 +41,8 @@ pub enum Token<'a> {
     While,
     #[token("for")]
     For,
+    #[token("in")]
+    In,
     #[token("break")]
     Break,
     #[token("continue")]
@@ -193,6 +195,7 @@ impl fmt::Display for Token<'_> {
             Token::Loop => write!(f, "loop"),
             Token::While => write!(f, "while"),
             Token::For => write!(f, "for"),
+            Token::In => write!(f, "in"),
             Token::Break => write!(f, "break"),
             Token::Continue => write!(f, "continue"),
             Token::Return => write!(f, "return"),

@@ -83,7 +83,7 @@ pub fn typeck(module: &Module) -> Result<(), TypeError> {
 fn check_function(func: &Function) -> Result<(), TypeError> {
     let ret_ty = resolve_type(&func.return_ty)?;
     let mut env = Env::new();
-    if !check_block(&func.body, ret_ty, &mut env)? {
+    if check_block(&func.body, ret_ty, &mut env, 0)? != Flow::Return {
         return Err(TypeError {
             message: "missing `return`".into(),
         });
@@ -101,21 +101,49 @@ fn resolve_type(ty: &Type) -> Result<Ty, TypeError> {
     }
 }
 
-/// Returns whether every path through `block` returns.
-fn check_block(block: &Block, return_ty: Ty, env: &mut Env) -> Result<bool, TypeError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Next,
+    Jump,
+    Return,
+}
+
+fn join_if(then: Flow, else_: Option<Flow>) -> Flow {
+    match else_ {
+        None => Flow::Next,
+        Some(else_) => match (then, else_) {
+            (Flow::Return, Flow::Return) => Flow::Return,
+            (Flow::Next, _) | (_, Flow::Next) => Flow::Next,
+            _ => Flow::Jump,
+        },
+    }
+}
+
+/// Returns how control leaves `block`.
+fn check_block(
+    block: &Block,
+    return_ty: Ty,
+    env: &mut Env,
+    loop_depth: u32,
+) -> Result<Flow, TypeError> {
     env.push();
-    let mut always_returns = false;
+    let mut flow = Flow::Next;
     for stmt in &block.stmts {
-        if check_stmt(stmt, return_ty, env)? {
-            always_returns = true;
+        flow = check_stmt(stmt, return_ty, env, loop_depth)?;
+        if flow != Flow::Next {
             break;
         }
     }
     env.pop();
-    Ok(always_returns)
+    Ok(flow)
 }
 
-fn check_stmt(stmt: &Stmt, return_ty: Ty, env: &mut Env) -> Result<bool, TypeError> {
+fn check_stmt(
+    stmt: &Stmt,
+    return_ty: Ty,
+    env: &mut Env,
+    loop_depth: u32,
+) -> Result<Flow, TypeError> {
     match stmt {
         Stmt::Return(expr) => {
             let ty = check_expr(expr, env)?;
@@ -128,7 +156,7 @@ fn check_stmt(stmt: &Stmt, return_ty: Ty, env: &mut Env) -> Result<bool, TypeErr
                     ),
                 });
             }
-            Ok(true)
+            Ok(Flow::Return)
         }
         Stmt::Print(expr) => {
             let ty = check_expr(expr, env)?;
@@ -137,7 +165,7 @@ fn check_stmt(stmt: &Stmt, return_ty: Ty, env: &mut Env) -> Result<bool, TypeErr
                     message: format!("`print` requires `i32`, found `{}`", ty.name()),
                 });
             }
-            Ok(false)
+            Ok(Flow::Next)
         }
         Stmt::Let { name, ty, value } => {
             let value_ty = check_expr(value, env)?;
@@ -158,7 +186,7 @@ fn check_stmt(stmt: &Stmt, return_ty: Ty, env: &mut Env) -> Result<bool, TypeErr
                 None => value_ty,
             };
             env.declare(name, ty)?;
-            Ok(false)
+            Ok(Flow::Next)
         }
         Stmt::Assign { name, value } => {
             let Some(var_ty) = env.get(name) else {
@@ -176,7 +204,7 @@ fn check_stmt(stmt: &Stmt, return_ty: Ty, env: &mut Env) -> Result<bool, TypeErr
                     ),
                 });
             }
-            Ok(false)
+            Ok(Flow::Next)
         }
         Stmt::If {
             cond,
@@ -189,14 +217,12 @@ fn check_stmt(stmt: &Stmt, return_ty: Ty, env: &mut Env) -> Result<bool, TypeErr
                     message: format!("`if` condition must be `bool`, found `{}`", cond_ty.name()),
                 });
             }
-            let then_returns = check_block(then_block, return_ty, env)?;
-            match else_block {
-                Some(else_block) => {
-                    let else_returns = check_block(else_block, return_ty, env)?;
-                    Ok(then_returns && else_returns)
-                }
-                None => Ok(false),
-            }
+            let then_flow = check_block(then_block, return_ty, env, loop_depth)?;
+            let else_flow = match else_block {
+                Some(else_block) => Some(check_block(else_block, return_ty, env, loop_depth)?),
+                None => None,
+            };
+            Ok(join_if(then_flow, else_flow))
         }
         Stmt::While { cond, body } => {
             let cond_ty = check_expr(cond, env)?;
@@ -208,8 +234,47 @@ fn check_stmt(stmt: &Stmt, return_ty: Ty, env: &mut Env) -> Result<bool, TypeErr
                     ),
                 });
             }
-            let _ = check_block(body, return_ty, env)?;
-            Ok(false)
+            let _ = check_block(body, return_ty, env, loop_depth + 1)?;
+            Ok(Flow::Next)
+        }
+        Stmt::For {
+            name,
+            start,
+            end,
+            body,
+        } => {
+            let start_ty = check_expr(start, env)?;
+            let end_ty = check_expr(end, env)?;
+            if start_ty != Ty::I32 || end_ty != Ty::I32 {
+                return Err(TypeError {
+                    message: format!(
+                        "`for` range bounds must be `i32`, found `{}` and `{}`",
+                        start_ty.name(),
+                        end_ty.name()
+                    ),
+                });
+            }
+            env.push();
+            env.declare(name, Ty::I32)?;
+            let _ = check_block(body, return_ty, env, loop_depth + 1)?;
+            env.pop();
+            Ok(Flow::Next)
+        }
+        Stmt::Break => {
+            if loop_depth == 0 {
+                return Err(TypeError {
+                    message: "`break` outside of a loop".into(),
+                });
+            }
+            Ok(Flow::Jump)
+        }
+        Stmt::Continue => {
+            if loop_depth == 0 {
+                return Err(TypeError {
+                    message: "`continue` outside of a loop".into(),
+                });
+            }
+            Ok(Flow::Jump)
         }
     }
 }
@@ -421,5 +486,25 @@ mod tests {
     fn rejects_not_on_i32() {
         let err = check("fn main() -> i32 { if !1 { return 0; } return 1; }").unwrap_err();
         assert!(err.message.contains("bool"), "{}", err.message);
+    }
+
+    #[test]
+    fn accepts_for_break_continue() {
+        assert!(check(
+            "fn main() -> i32 { for i in 0..3 { if i == 1 { continue; } if i == 2 { break; } } return 0; }"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_break_outside_loop() {
+        let err = check("fn main() -> i32 { break; return 0; }").unwrap_err();
+        assert!(err.message.contains("break"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_for_bool_range() {
+        let err = check("fn main() -> i32 { for i in true..1 { } return 0; }").unwrap_err();
+        assert!(err.message.contains("i32"), "{}", err.message);
     }
 }

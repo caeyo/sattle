@@ -52,6 +52,14 @@ pub enum Stmt {
         cond: Expr,
         body: Block,
     },
+    For {
+        name: String,
+        start: Expr,
+        end: Expr,
+        body: Block,
+    },
+    Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +238,32 @@ fn write_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             indent(out, depth + 1);
             out.push_str("Body\n");
             write_block(out, body, depth + 2);
+        }
+        Stmt::For {
+            name,
+            start,
+            end,
+            body,
+        } => {
+            indent(out, depth);
+            out.push_str(&format!("For {name}\n"));
+            indent(out, depth + 1);
+            out.push_str("Start\n");
+            write_expr(out, start, depth + 2);
+            indent(out, depth + 1);
+            out.push_str("End\n");
+            write_expr(out, end, depth + 2);
+            indent(out, depth + 1);
+            out.push_str("Body\n");
+            write_block(out, body, depth + 2);
+        }
+        Stmt::Break => {
+            indent(out, depth);
+            out.push_str("Break\n");
+        }
+        Stmt::Continue => {
+            indent(out, depth);
+            out.push_str("Continue\n");
         }
     }
 }

@@ -156,6 +156,7 @@ fn codegen_main<'ctx>(
         builder,
         llvm_fn,
         scopes: Vec::new(),
+        loops: Vec::new(),
     };
     cg.codegen_block(&func.body)?;
     if !cg.terminated() {
@@ -171,12 +172,18 @@ struct Var<'ctx> {
     ty: Ty,
 }
 
+struct Loop<'ctx> {
+    cont: BasicBlock<'ctx>,
+    brk: BasicBlock<'ctx>,
+}
+
 struct Codegen<'ctx, 'a> {
     context: &'ctx Context,
     llvm_module: &'a LlvmModule<'ctx>,
     builder: &'a Builder<'ctx>,
     llvm_fn: FunctionValue<'ctx>,
     scopes: Vec<HashMap<String, Var<'ctx>>>,
+    loops: Vec<Loop<'ctx>>,
 }
 
 impl<'ctx, 'a> Codegen<'ctx, 'a> {
@@ -307,6 +314,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 else_block,
             } => self.codegen_if(cond, then_block, else_block.as_ref()),
             Stmt::While { cond, body } => self.codegen_while(cond, body),
+            Stmt::For {
+                name,
+                start,
+                end,
+                body,
+            } => self.codegen_for(name, start, end, body),
+            Stmt::Break => self.codegen_loop_jump(true),
+            Stmt::Continue => self.codegen_loop_jump(false),
         }
     }
 
@@ -381,7 +396,12 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             })?;
 
         self.builder.position_at_end(body_bb);
+        self.loops.push(Loop {
+            cont: cond_bb,
+            brk: after_bb,
+        });
         self.codegen_block(body)?;
+        self.loops.pop();
         if !self.terminated() {
             self.builder
                 .build_unconditional_branch(cond_bb)
@@ -391,6 +411,119 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         }
 
         self.builder.position_at_end(after_bb);
+        Ok(())
+    }
+
+    fn codegen_for(
+        &mut self,
+        name: &str,
+        start: &Expr,
+        end: &Expr,
+        body: &Block,
+    ) -> Result<(), CodegenError> {
+        let start = self.codegen_expr(start)?;
+        let end = self.codegen_expr(end)?;
+        let i_ptr = self.alloca(Ty::I32, name)?;
+        let hi_ptr = self.alloca(Ty::I32, "for.end")?;
+        self.builder.build_store(i_ptr, start).map_err(|e| CodegenError {
+            message: format!("failed to store `{name}`: {e}"),
+        })?;
+        self.builder.build_store(hi_ptr, end).map_err(|e| CodegenError {
+            message: format!("failed to store for-range end: {e}"),
+        })?;
+
+        self.push_scope();
+        self.declare(name, Var { ptr: i_ptr, ty: Ty::I32 });
+
+        let cond_bb = self.context.append_basic_block(self.llvm_fn, "for.cond");
+        let body_bb = self.context.append_basic_block(self.llvm_fn, "for.body");
+        let inc_bb = self.context.append_basic_block(self.llvm_fn, "for.inc");
+        let after_bb = self.context.append_basic_block(self.llvm_fn, "for.after");
+        self.builder
+            .build_unconditional_branch(cond_bb)
+            .map_err(|e| CodegenError {
+                message: format!("failed to enter for: {e}"),
+            })?;
+
+        self.builder.position_at_end(cond_bb);
+        let i_val = self
+            .builder
+            .build_load(self.context.i32_type(), i_ptr, name)
+            .map_err(|e| CodegenError {
+                message: format!("failed to load `{name}`: {e}"),
+            })?
+            .into_int_value();
+        let hi_val = self
+            .builder
+            .build_load(self.context.i32_type(), hi_ptr, "for.end")
+            .map_err(|e| CodegenError {
+                message: format!("failed to load for-range end: {e}"),
+            })?
+            .into_int_value();
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, i_val, hi_val, "for.cmp")
+            .map_err(|e| CodegenError {
+                message: format!("failed to build for: {e}"),
+            })?;
+        self.builder
+            .build_conditional_branch(cond, body_bb, after_bb)
+            .map_err(|e| CodegenError {
+                message: format!("failed to build for: {e}"),
+            })?;
+
+        self.builder.position_at_end(body_bb);
+        self.loops.push(Loop {
+            cont: inc_bb,
+            brk: after_bb,
+        });
+        self.codegen_block(body)?;
+        self.loops.pop();
+        if !self.terminated() {
+            self.builder
+                .build_unconditional_branch(inc_bb)
+                .map_err(|e| CodegenError {
+                    message: format!("failed to leave for body: {e}"),
+                })?;
+        }
+
+        self.builder.position_at_end(inc_bb);
+        let i_val = self
+            .builder
+            .build_load(self.context.i32_type(), i_ptr, name)
+            .map_err(|e| CodegenError {
+                message: format!("failed to load `{name}`: {e}"),
+            })?
+            .into_int_value();
+        let next = self
+            .builder
+            .build_int_add(i_val, self.context.i32_type().const_int(1, true), "for.inc")
+            .map_err(|e| CodegenError {
+                message: format!("failed to increment `{name}`: {e}"),
+            })?;
+        self.builder.build_store(i_ptr, next).map_err(|e| CodegenError {
+            message: format!("failed to store `{name}`: {e}"),
+        })?;
+        self.builder
+            .build_unconditional_branch(cond_bb)
+            .map_err(|e| CodegenError {
+                message: format!("failed to loop: {e}"),
+            })?;
+
+        self.builder.position_at_end(after_bb);
+        self.pop_scope();
+        Ok(())
+    }
+
+    fn codegen_loop_jump(&self, is_break: bool) -> Result<(), CodegenError> {
+        let what = if is_break { "break" } else { "continue" };
+        let dest = self.loops.last().unwrap();
+        let dest = if is_break { dest.brk } else { dest.cont };
+        self.builder
+            .build_unconditional_branch(dest)
+            .map_err(|e| CodegenError {
+                message: format!("failed to build `{what}`: {e}"),
+            })?;
         Ok(())
     }
 

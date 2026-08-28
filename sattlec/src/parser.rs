@@ -133,6 +133,17 @@ impl<'a> Parser<'a> {
             Some(Token::Let) => self.parse_let(),
             Some(Token::If) => self.parse_if(),
             Some(Token::While) => self.parse_while(),
+            Some(Token::For) => self.parse_for(),
+            Some(Token::Break) => {
+                self.bump();
+                self.expect(&Token::Semi, "`;`")?;
+                Ok(Stmt::Break)
+            }
+            Some(Token::Continue) => {
+                self.bump();
+                self.expect(&Token::Semi, "`;`")?;
+                Ok(Stmt::Continue)
+            }
             Some(Token::Ident(_)) if matches!(self.peek_nth_kind(1), Some(Token::Eq)) => {
                 self.parse_assign()
             }
@@ -192,6 +203,22 @@ impl<'a> Parser<'a> {
         let cond = self.parse_expr()?;
         let body = self.parse_block()?;
         Ok(Stmt::While { cond, body })
+    }
+
+    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&Token::For, "`for`")?;
+        let name = self.expect_ident("loop variable")?;
+        self.expect(&Token::In, "`in`")?;
+        let start = self.parse_expr()?;
+        self.expect(&Token::DotDot, "`..`")?;
+        let end = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(Stmt::For {
+            name,
+            start,
+            end,
+            body,
+        })
     }
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
@@ -479,6 +506,19 @@ Module
         assert!(matches!(&func.body.stmts[0], Stmt::Let { name, .. } if name == "i"));
         assert!(matches!(&func.body.stmts[1], Stmt::While { .. }));
         assert!(matches!(&func.body.stmts[2], Stmt::If { .. }));
+    }
+
+    #[test]
+    fn parses_for_break_continue() {
+        let module = parse_src(
+            "fn main() -> i32 { for i in 0..3 { if i == 1 { continue; } break; } return 0; }",
+        );
+        let Item::Fn(func) = &module.items[0];
+        assert!(matches!(&func.body.stmts[0], Stmt::For { name, .. } if name == "i"));
+        let Stmt::For { body, .. } = &func.body.stmts[0] else {
+            panic!("expected for");
+        };
+        assert!(matches!(&body.stmts[1], Stmt::Break));
     }
 
     fn return_expr(src: &str) -> Expr {
