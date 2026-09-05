@@ -11,6 +11,7 @@ pub struct Module {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     Fn(Function),
+    Struct(StructItem),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +23,18 @@ pub struct Function {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructItem {
+    pub name: String,
+    pub fields: Vec<Field>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    pub name: String,
+    pub ty: Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
     pub name: String,
     pub ty: Type,
@@ -30,6 +43,7 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     Name(String),
+    Ptr(Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +61,7 @@ pub enum Stmt {
         value: Expr,
     },
     Assign {
-        name: String,
+        target: Expr,
         value: Expr,
     },
     If {
@@ -78,6 +92,14 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    StructLit {
+        name: String,
+        fields: Vec<(String, Expr)>,
+    },
+    Field {
+        base: Box<Expr>,
+        field: String,
+    },
     Unary {
         op: UnOp,
         expr: Box<Expr>,
@@ -93,6 +115,8 @@ pub enum Expr {
 pub enum UnOp {
     Neg,
     Not,
+    Deref,
+    AddrOf,
 }
 
 impl fmt::Display for UnOp {
@@ -100,6 +124,8 @@ impl fmt::Display for UnOp {
         match self {
             UnOp::Neg => write!(f, "-"),
             UnOp::Not => write!(f, "!"),
+            UnOp::Deref => write!(f, "*"),
+            UnOp::AddrOf => write!(f, "&"),
         }
     }
 }
@@ -165,6 +191,7 @@ fn write_module(out: &mut String, module: &Module, depth: usize) {
 fn write_item(out: &mut String, item: &Item, depth: usize) {
     match item {
         Item::Fn(func) => write_function(out, func, depth),
+        Item::Struct(def) => write_struct(out, def, depth),
     }
 }
 
@@ -188,10 +215,24 @@ fn write_function(out: &mut String, func: &Function, depth: usize) {
     write_block(out, &func.body, depth + 2);
 }
 
+fn write_struct(out: &mut String, def: &StructItem, depth: usize) {
+    indent(out, depth);
+    out.push_str(&format!("Struct {}\n", def.name));
+    for field in &def.fields {
+        indent(out, depth + 1);
+        out.push_str(&format!("Field {}\n", field.name));
+        write_type(out, &field.ty, depth + 2);
+    }
+}
+
 fn write_type(out: &mut String, ty: &Type, depth: usize) {
     indent(out, depth);
     match ty {
         Type::Name(name) => out.push_str(&format!("Name({name})\n")),
+        Type::Ptr(inner) => {
+            out.push_str("Ptr\n");
+            write_type(out, inner, depth + 1);
+        }
     }
 }
 
@@ -225,9 +266,10 @@ fn write_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             }
             write_expr(out, value, depth + 1);
         }
-        Stmt::Assign { name, value } => {
+        Stmt::Assign { target, value } => {
             indent(out, depth);
-            out.push_str(&format!("Assign {name}\n"));
+            out.push_str("Assign\n");
+            write_expr(out, target, depth + 1);
             write_expr(out, value, depth + 1);
         }
         Stmt::If {
@@ -299,6 +341,18 @@ fn write_expr(out: &mut String, expr: &Expr, depth: usize) {
             for arg in args {
                 write_expr(out, arg, depth + 1);
             }
+        }
+        Expr::StructLit { name, fields } => {
+            out.push_str(&format!("StructLit {name}\n"));
+            for (field, value) in fields {
+                indent(out, depth + 1);
+                out.push_str(&format!("Field {field}\n"));
+                write_expr(out, value, depth + 2);
+            }
+        }
+        Expr::Field { base, field } => {
+            out.push_str(&format!("Field {field}\n"));
+            write_expr(out, base, depth + 1);
         }
         Expr::Unary { op, expr } => {
             out.push_str(&format!("Unary({op})\n"));

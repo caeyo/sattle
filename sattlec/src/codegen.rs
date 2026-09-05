@@ -9,10 +9,12 @@ use inkwell::module::Module as LlvmModule;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::values::{FunctionValue, IntValue, PointerValue};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType};
+use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
+use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 const PRINT_I32: &str = "sattle_print_i32";
@@ -103,18 +105,23 @@ fn build_module<'ctx>(
     llvm_module.set_source_file_name(source_name);
     declare_runtime(context, &llvm_module);
     let builder = context.create_builder();
+    let structs = declare_structs(context, module);
 
     let mut functions = HashMap::new();
     let mut saw_main = false;
     for item in &module.items {
-        match item {
-            Item::Fn(func) => {
-                if func.name == "main" {
-                    saw_main = true;
-                }
-                let llvm_fn = declare_function(context, &llvm_module, func);
-                functions.insert(func.name.clone(), llvm_fn);
+        if let Item::Fn(func) = item {
+            if func.name == "main" {
+                saw_main = true;
             }
+            let llvm_fn = declare_function(context, &llvm_module, &structs, func);
+            functions.insert(
+                func.name.clone(),
+                FnInfo {
+                    value: llvm_fn,
+                    ret: ast_ty(&func.return_ty),
+                },
+            );
         }
     }
 
@@ -125,10 +132,8 @@ fn build_module<'ctx>(
     }
 
     for item in &module.items {
-        match item {
-            Item::Fn(func) => {
-                codegen_function(context, &llvm_module, &builder, &functions, func)?;
-            }
+        if let Item::Fn(func) = item {
+            codegen_function(context, &llvm_module, &builder, &functions, &structs, func)?;
         }
     }
 
@@ -146,21 +151,97 @@ fn declare_runtime<'ctx>(context: &'ctx Context, llvm_module: &LlvmModule<'ctx>)
     llvm_module.add_function(PRINT_I32, ty, None);
 }
 
+struct LlvmStruct<'ctx> {
+    ty: StructType<'ctx>,
+    fields: Vec<(String, Ty)>,
+}
+
+impl<'ctx> LlvmStruct<'ctx> {
+    fn field(&self, name: &str) -> (u32, &Ty) {
+        self.fields
+            .iter()
+            .enumerate()
+            .find(|(_, (field, _))| field == name)
+            .map(|(i, (_, ty))| (i as u32, ty))
+            .expect("typeck")
+    }
+}
+
+struct FnInfo<'ctx> {
+    value: FunctionValue<'ctx>,
+    ret: Ty,
+}
+
+fn declare_structs<'ctx>(
+    context: &'ctx Context,
+    module: &Module,
+) -> HashMap<String, LlvmStruct<'ctx>> {
+    let mut structs = HashMap::new();
+    for item in &module.items {
+        if let Item::Struct(def) = item {
+            let fields = def
+                .fields
+                .iter()
+                .map(|field| (field.name.clone(), ast_ty(&field.ty)))
+                .collect();
+            structs.insert(
+                def.name.clone(),
+                LlvmStruct {
+                    ty: context.opaque_struct_type(&def.name),
+                    fields,
+                },
+            );
+        }
+    }
+    define_struct_bodies(context, &structs);
+    structs
+}
+
+fn define_struct_bodies<'ctx>(context: &'ctx Context, structs: &HashMap<String, LlvmStruct<'ctx>>) {
+    let mut remaining: HashSet<String> = structs.keys().cloned().collect();
+    while !remaining.is_empty() {
+        let mut progress = false;
+        let names: Vec<String> = remaining.iter().cloned().collect();
+        for name in names {
+            let ready = structs[&name].fields.iter().all(|(_, ty)| match ty {
+                Ty::Struct(inner) => !remaining.contains(inner),
+                _ => true,
+            });
+            if !ready {
+                continue;
+            }
+            let field_tys: Vec<BasicTypeEnum> = structs[&name]
+                .fields
+                .iter()
+                .map(|(_, ty)| llvm_ty(context, structs, ty))
+                .collect();
+            structs[&name].ty.set_body(&field_tys, false);
+            remaining.remove(&name);
+            progress = true;
+        }
+        assert!(progress, "typeck rejects recursive structs by value");
+    }
+}
+
 fn declare_function<'ctx>(
     context: &'ctx Context,
     llvm_module: &LlvmModule<'ctx>,
+    structs: &HashMap<String, LlvmStruct<'ctx>>,
     func: &Function,
 ) -> FunctionValue<'ctx> {
-    let ret = llvm_int_ty(context, ast_ty(&func.return_ty));
-    let params: Vec<_> = func
+    let ret = ast_ty(&func.return_ty);
+    let params: Vec<BasicMetadataTypeEnum> = func
         .params
         .iter()
-        .map(|param| llvm_int_ty(context, ast_ty(&param.ty)).into())
+        .map(|param| llvm_ty(context, structs, &ast_ty(&param.ty)).into())
         .collect();
-    let fn_ty = ret.fn_type(&params, false);
+    let fn_ty = llvm_ty(context, structs, &ret).fn_type(&params, false);
     let llvm_fn = llvm_module.add_function(&func.name, fn_ty, None);
     for (i, param) in func.params.iter().enumerate() {
-        llvm_fn.get_nth_param(i as u32).unwrap().set_name(&param.name);
+        llvm_fn
+            .get_nth_param(i as u32)
+            .unwrap()
+            .set_name(&param.name);
     }
     llvm_fn
 }
@@ -169,10 +250,11 @@ fn codegen_function<'ctx>(
     context: &'ctx Context,
     llvm_module: &LlvmModule<'ctx>,
     builder: &Builder<'ctx>,
-    functions: &HashMap<String, FunctionValue<'ctx>>,
+    functions: &HashMap<String, FnInfo<'ctx>>,
+    structs: &HashMap<String, LlvmStruct<'ctx>>,
     func: &Function,
 ) -> Result<(), CodegenError> {
-    let llvm_fn = functions[&func.name];
+    let llvm_fn = functions[&func.name].value;
     let entry = context.append_basic_block(llvm_fn, "entry");
     builder.position_at_end(entry);
     let mut cg = Codegen {
@@ -181,14 +263,15 @@ fn codegen_function<'ctx>(
         builder,
         llvm_fn,
         functions,
+        structs,
         scopes: Vec::new(),
         loops: Vec::new(),
     };
     cg.push_scope();
     for (i, param) in func.params.iter().enumerate() {
         let ty = ast_ty(&param.ty);
-        let val = llvm_fn.get_nth_param(i as u32).unwrap().into_int_value();
-        let ptr = cg.alloca(ty, &param.name)?;
+        let val = llvm_fn.get_nth_param(i as u32).unwrap();
+        let ptr = cg.alloca(&ty, &param.name)?;
         cg.builder.build_store(ptr, val).map_err(|e| CodegenError {
             message: format!("failed to store `{}`: {e}", param.name),
         })?;
@@ -214,12 +297,34 @@ struct Loop<'ctx> {
     brk: BasicBlock<'ctx>,
 }
 
+struct Place<'ctx> {
+    ptr: PointerValue<'ctx>,
+    ty: Ty,
+}
+
+struct CVal<'ctx> {
+    value: BasicValueEnum<'ctx>,
+    ty: Ty,
+}
+
+impl<'ctx> CVal<'ctx> {
+    fn int(self) -> IntValue<'ctx> {
+        self.value.into_int_value()
+    }
+}
+
+enum Operand<'ctx> {
+    Place(Place<'ctx>),
+    Value(CVal<'ctx>),
+}
+
 struct Codegen<'ctx, 'a> {
     context: &'ctx Context,
     llvm_module: &'a LlvmModule<'ctx>,
     builder: &'a Builder<'ctx>,
     llvm_fn: FunctionValue<'ctx>,
-    functions: &'a HashMap<String, FunctionValue<'ctx>>,
+    functions: &'a HashMap<String, FnInfo<'ctx>>,
+    structs: &'a HashMap<String, LlvmStruct<'ctx>>,
     scopes: Vec<HashMap<String, Var<'ctx>>>,
     loops: Vec<Loop<'ctx>>,
 }
@@ -257,17 +362,27 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             })
     }
 
-    fn llvm_ty(&self, ty: Ty) -> inkwell::types::IntType<'ctx> {
-        llvm_int_ty(self.context, ty)
+    fn ptr_ty(&self) -> inkwell::types::PointerType<'ctx> {
+        self.context.ptr_type(AddressSpace::default())
     }
 
-    fn alloca(&self, ty: Ty, name: &str) -> Result<PointerValue<'ctx>, CodegenError> {
-        let current = self.builder.get_insert_block().ok_or_else(|| CodegenError {
-            message: "alloca without insert block".into(),
-        })?;
-        let entry = self.llvm_fn.get_first_basic_block().ok_or_else(|| CodegenError {
-            message: "function has no entry block".into(),
-        })?;
+    fn llvm_ty(&self, ty: &Ty) -> BasicTypeEnum<'ctx> {
+        llvm_ty(self.context, self.structs, ty)
+    }
+
+    fn alloca(&self, ty: &Ty, name: &str) -> Result<PointerValue<'ctx>, CodegenError> {
+        let current = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| CodegenError {
+                message: "alloca without insert block".into(),
+            })?;
+        let entry = self
+            .llvm_fn
+            .get_first_basic_block()
+            .ok_or_else(|| CodegenError {
+                message: "function has no entry block".into(),
+            })?;
         match entry.get_first_instruction() {
             Some(first) => self.builder.position_before(&first),
             None => self.builder.position_at_end(entry),
@@ -282,14 +397,17 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok(ptr)
     }
 
-    fn load(&self, var: &Var<'ctx>, name: &str) -> Result<IntValue<'ctx>, CodegenError> {
+    fn load_place(&self, place: Place<'ctx>) -> Result<CVal<'ctx>, CodegenError> {
         let value = self
             .builder
-            .build_load(self.llvm_ty(var.ty), var.ptr, name)
+            .build_load(self.llvm_ty(&place.ty), place.ptr, "")
             .map_err(|e| CodegenError {
-                message: format!("failed to load `{name}`: {e}"),
+                message: format!("failed to load: {e}"),
             })?;
-        Ok(value.into_int_value())
+        Ok(CVal {
+            value,
+            ty: place.ty,
+        })
     }
 
     fn codegen_block(&mut self, block: &Block) -> Result<(), CodegenError> {
@@ -309,14 +427,14 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Stmt::Return(expr) => {
                 let value = self.codegen_expr(expr)?;
                 self.builder
-                    .build_return(Some(&value))
+                    .build_return(Some(&value.value))
                     .map_err(|e| CodegenError {
                         message: format!("failed to build return: {e}"),
                     })?;
                 Ok(())
             }
             Stmt::Print(expr) => {
-                let value = self.codegen_expr(expr)?;
+                let value = self.codegen_expr(expr)?.int();
                 let print_fn = runtime_print_i32(self.llvm_module)?;
                 self.builder
                     .build_call(print_fn, &[value.into()], "")
@@ -327,20 +445,23 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             }
             Stmt::Let { name, value, .. } => {
                 let init = self.codegen_expr(value)?;
-                let ty = int_value_ty(self.context, init);
-                let ptr = self.alloca(ty, name)?;
-                self.builder.build_store(ptr, init).map_err(|e| CodegenError {
-                    message: format!("failed to store `{name}`: {e}"),
-                })?;
-                self.declare(name, Var { ptr, ty });
+                let ptr = self.alloca(&init.ty, name)?;
+                self.builder
+                    .build_store(ptr, init.value)
+                    .map_err(|e| CodegenError {
+                        message: format!("failed to store `{name}`: {e}"),
+                    })?;
+                self.declare(name, Var { ptr, ty: init.ty });
                 Ok(())
             }
-            Stmt::Assign { name, value } => {
+            Stmt::Assign { target, value } => {
+                let place = self.codegen_place(target)?;
                 let val = self.codegen_expr(value)?;
-                let ptr = self.lookup(name)?.ptr;
-                self.builder.build_store(ptr, val).map_err(|e| CodegenError {
-                    message: format!("failed to assign `{name}`: {e}"),
-                })?;
+                self.builder
+                    .build_store(place.ptr, val.value)
+                    .map_err(|e| CodegenError {
+                        message: format!("failed to assign: {e}"),
+                    })?;
                 Ok(())
             }
             Stmt::If {
@@ -366,7 +487,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         then_block: &Block,
         else_block: Option<&Block>,
     ) -> Result<(), CodegenError> {
-        let cond = self.codegen_expr(cond)?;
+        let cond = self.codegen_expr(cond)?.int();
         let then_bb = self.context.append_basic_block(self.llvm_fn, "if.then");
         let else_bb = self.context.append_basic_block(self.llvm_fn, "if.else");
         self.builder
@@ -423,7 +544,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             })?;
 
         self.builder.position_at_end(cond_bb);
-        let cond = self.codegen_expr(cond)?;
+        let cond = self.codegen_expr(cond)?.int();
         self.builder
             .build_conditional_branch(cond, body_bb, after_bb)
             .map_err(|e| CodegenError {
@@ -456,19 +577,29 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         end: &Expr,
         body: &Block,
     ) -> Result<(), CodegenError> {
-        let start = self.codegen_expr(start)?;
-        let end = self.codegen_expr(end)?;
-        let i_ptr = self.alloca(Ty::I32, name)?;
-        let hi_ptr = self.alloca(Ty::I32, "for.end")?;
-        self.builder.build_store(i_ptr, start).map_err(|e| CodegenError {
-            message: format!("failed to store `{name}`: {e}"),
-        })?;
-        self.builder.build_store(hi_ptr, end).map_err(|e| CodegenError {
-            message: format!("failed to store for-range end: {e}"),
-        })?;
+        let start = self.codegen_expr(start)?.int();
+        let end = self.codegen_expr(end)?.int();
+        let i_ptr = self.alloca(&Ty::I32, name)?;
+        let hi_ptr = self.alloca(&Ty::I32, "for.end")?;
+        self.builder
+            .build_store(i_ptr, start)
+            .map_err(|e| CodegenError {
+                message: format!("failed to store `{name}`: {e}"),
+            })?;
+        self.builder
+            .build_store(hi_ptr, end)
+            .map_err(|e| CodegenError {
+                message: format!("failed to store for-range end: {e}"),
+            })?;
 
         self.push_scope();
-        self.declare(name, Var { ptr: i_ptr, ty: Ty::I32 });
+        self.declare(
+            name,
+            Var {
+                ptr: i_ptr,
+                ty: Ty::I32,
+            },
+        );
 
         let cond_bb = self.context.append_basic_block(self.llvm_fn, "for.cond");
         let body_bb = self.context.append_basic_block(self.llvm_fn, "for.body");
@@ -536,9 +667,11 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             .map_err(|e| CodegenError {
                 message: format!("failed to increment `{name}`: {e}"),
             })?;
-        self.builder.build_store(i_ptr, next).map_err(|e| CodegenError {
-            message: format!("failed to store `{name}`: {e}"),
-        })?;
+        self.builder
+            .build_store(i_ptr, next)
+            .map_err(|e| CodegenError {
+                message: format!("failed to store `{name}`: {e}"),
+            })?;
         self.builder
             .build_unconditional_branch(cond_bb)
             .map_err(|e| CodegenError {
@@ -562,86 +695,307 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
         Ok(())
     }
 
-    fn codegen_expr(&self, expr: &Expr) -> Result<IntValue<'ctx>, CodegenError> {
+    fn codegen_expr(&self, expr: &Expr) -> Result<CVal<'ctx>, CodegenError> {
+        match self.codegen_operand(expr)? {
+            Operand::Place(place) => self.load_place(place),
+            Operand::Value(value) => Ok(value),
+        }
+    }
+
+    fn codegen_place(&self, expr: &Expr) -> Result<Place<'ctx>, CodegenError> {
+        match self.codegen_operand(expr)? {
+            Operand::Place(place) => Ok(place),
+            Operand::Value(_) => Err(CodegenError {
+                message: "cannot assign to this expression".into(),
+            }),
+        }
+    }
+
+    fn codegen_operand(&self, expr: &Expr) -> Result<Operand<'ctx>, CodegenError> {
         match expr {
-            Expr::Int(value) => Ok(self.context.i32_type().const_int(*value as u64, true)),
-            Expr::Bool(value) => Ok(self.context.bool_type().const_int(u64::from(*value), false)),
+            Expr::Int(value) => Ok(Operand::Value(CVal {
+                value: self
+                    .context
+                    .i32_type()
+                    .const_int(*value as u64, true)
+                    .into(),
+                ty: Ty::I32,
+            })),
+            Expr::Bool(value) => Ok(Operand::Value(CVal {
+                value: self
+                    .context
+                    .bool_type()
+                    .const_int(u64::from(*value), false)
+                    .into(),
+                ty: Ty::Bool,
+            })),
             Expr::Var(name) => {
                 let var = self.lookup(name)?;
-                self.load(var, name)
+                Ok(Operand::Place(Place {
+                    ptr: var.ptr,
+                    ty: var.ty.clone(),
+                }))
             }
             Expr::Call { name, args } => {
-                let callee = *self.functions.get(name).unwrap();
+                let info = &self.functions[name];
                 let mut compiled = Vec::new();
                 for arg in args {
-                    compiled.push(self.codegen_expr(arg)?.into());
+                    compiled.push(self.codegen_expr(arg)?.value.into());
                 }
                 let call = self
                     .builder
-                    .build_call(callee, &compiled, "call")
+                    .build_call(info.value, &compiled, "call")
                     .map_err(|e| CodegenError {
                         message: format!("failed to call `{name}`: {e}"),
                     })?;
-                Ok(call.try_as_basic_value().basic().unwrap().into_int_value())
+                Ok(Operand::Value(CVal {
+                    value: call.try_as_basic_value().basic().unwrap(),
+                    ty: info.ret.clone(),
+                }))
             }
-            Expr::Unary { op, expr } => {
-                let value = self.codegen_expr(expr)?;
-                match op {
-                    UnOp::Neg => {
-                        self.builder.build_int_neg(value, "neg").map_err(|e| CodegenError {
-                            message: format!("failed to build neg: {e}"),
-                        })
-                    }
-                    UnOp::Not => self.builder.build_not(value, "not").map_err(|e| CodegenError {
-                        message: format!("failed to build not: {e}"),
-                    }),
+            Expr::StructLit { name, fields } => {
+                Ok(Operand::Value(self.codegen_struct_lit(name, fields)?))
+            }
+            Expr::Field { base, field } => self.codegen_field(base, field),
+            Expr::Unary { op, expr } => match op {
+                UnOp::Neg => {
+                    let value = self.codegen_expr(expr)?.int();
+                    let neg =
+                        self.builder
+                            .build_int_neg(value, "neg")
+                            .map_err(|e| CodegenError {
+                                message: format!("failed to build neg: {e}"),
+                            })?;
+                    Ok(Operand::Value(CVal {
+                        value: neg.into(),
+                        ty: Ty::I32,
+                    }))
                 }
-            }
+                UnOp::Not => {
+                    let value = self.codegen_expr(expr)?.int();
+                    let not = self
+                        .builder
+                        .build_not(value, "not")
+                        .map_err(|e| CodegenError {
+                            message: format!("failed to build not: {e}"),
+                        })?;
+                    Ok(Operand::Value(CVal {
+                        value: not.into(),
+                        ty: Ty::Bool,
+                    }))
+                }
+                UnOp::Deref => {
+                    let value = self.codegen_expr(expr)?;
+                    let Ty::Ptr(inner) = value.ty else {
+                        unreachable!("typeck");
+                    };
+                    Ok(Operand::Place(Place {
+                        ptr: value.value.into_pointer_value(),
+                        ty: *inner,
+                    }))
+                }
+                UnOp::AddrOf => {
+                    let place = self.codegen_place(expr)?;
+                    Ok(Operand::Value(CVal {
+                        value: place.ptr.into(),
+                        ty: Ty::Ptr(Box::new(place.ty)),
+                    }))
+                }
+            },
             Expr::Binary {
                 op: op @ (BinOp::And | BinOp::Or),
                 lhs,
                 rhs,
-            } => self.codegen_short_circuit(*op, lhs, rhs),
+            } => Ok(Operand::Value(CVal {
+                value: self.codegen_short_circuit(*op, lhs, rhs)?.into(),
+                ty: Ty::Bool,
+            })),
             Expr::Binary { op, lhs, rhs } => {
-                let lhs = self.codegen_expr(lhs)?;
-                let rhs = self.codegen_expr(rhs)?;
-                match op {
-                    BinOp::Add => self.builder.build_int_add(lhs, rhs, "add").map_err(|e| {
-                        CodegenError {
-                            message: format!("failed to build add: {e}"),
-                        }
-                    }),
-                    BinOp::Sub => self.builder.build_int_sub(lhs, rhs, "sub").map_err(|e| {
-                        CodegenError {
-                            message: format!("failed to build sub: {e}"),
-                        }
-                    }),
-                    BinOp::Mul => self.builder.build_int_mul(lhs, rhs, "mul").map_err(|e| {
-                        CodegenError {
-                            message: format!("failed to build mul: {e}"),
-                        }
-                    }),
-                    BinOp::Div => self
-                        .builder
-                        .build_int_signed_div(lhs, rhs, "div")
-                        .map_err(|e| CodegenError {
-                            message: format!("failed to build div: {e}"),
-                        }),
-                    BinOp::Rem => self
-                        .builder
-                        .build_int_signed_rem(lhs, rhs, "rem")
-                        .map_err(|e| CodegenError {
-                            message: format!("failed to build rem: {e}"),
-                        }),
-                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let lhs = self.codegen_expr(lhs)?.int();
+                let rhs = self.codegen_expr(rhs)?.int();
+                let (value, ty) = match op {
+                    BinOp::Add => (
+                        self.builder
+                            .build_int_add(lhs, rhs, "add")
+                            .map_err(|e| CodegenError {
+                                message: format!("failed to build add: {e}"),
+                            })?,
+                        Ty::I32,
+                    ),
+                    BinOp::Sub => (
+                        self.builder
+                            .build_int_sub(lhs, rhs, "sub")
+                            .map_err(|e| CodegenError {
+                                message: format!("failed to build sub: {e}"),
+                            })?,
+                        Ty::I32,
+                    ),
+                    BinOp::Mul => (
+                        self.builder
+                            .build_int_mul(lhs, rhs, "mul")
+                            .map_err(|e| CodegenError {
+                                message: format!("failed to build mul: {e}"),
+                            })?,
+                        Ty::I32,
+                    ),
+                    BinOp::Div => (
+                        self.builder
+                            .build_int_signed_div(lhs, rhs, "div")
+                            .map_err(|e| CodegenError {
+                                message: format!("failed to build div: {e}"),
+                            })?,
+                        Ty::I32,
+                    ),
+                    BinOp::Rem => (
+                        self.builder
+                            .build_int_signed_rem(lhs, rhs, "rem")
+                            .map_err(|e| CodegenError {
+                                message: format!("failed to build rem: {e}"),
+                            })?,
+                        Ty::I32,
+                    ),
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => (
                         self.builder
                             .build_int_compare(int_pred(*op), lhs, rhs, "cmp")
                             .map_err(|e| CodegenError {
                                 message: format!("failed to build compare: {e}"),
-                            })
-                    }
+                            })?,
+                        Ty::Bool,
+                    ),
                     BinOp::And | BinOp::Or => unreachable!("short-circuit ops are handled above"),
+                };
+                Ok(Operand::Value(CVal {
+                    value: value.into(),
+                    ty,
+                }))
+            }
+        }
+    }
+
+    fn codegen_struct_lit(
+        &self,
+        name: &str,
+        fields: &[(String, Expr)],
+    ) -> Result<CVal<'ctx>, CodegenError> {
+        let info = &self.structs[name];
+        let mut agg = info.ty.get_undef();
+        for (i, (field_name, _)) in info.fields.iter().enumerate() {
+            let value = fields
+                .iter()
+                .find(|(n, _)| n == field_name)
+                .map(|(_, expr)| expr)
+                .expect("typeck");
+            let value = self.codegen_expr(value)?;
+            agg = self
+                .builder
+                .build_insert_value(agg, value.value, i as u32, field_name)
+                .map_err(|e| CodegenError {
+                    message: format!("failed to insert field `{field_name}`: {e}"),
+                })?
+                .into_struct_value();
+        }
+        Ok(CVal {
+            value: agg.into(),
+            ty: Ty::Struct(name.to_string()),
+        })
+    }
+
+    fn codegen_field(&self, base: &Expr, field: &str) -> Result<Operand<'ctx>, CodegenError> {
+        match self.codegen_operand(base)? {
+            Operand::Place(place) => {
+                let (ptr, name) = self.peel_place_to_struct(place)?;
+                Ok(Operand::Place(self.field_place(ptr, &name, field)?))
+            }
+            Operand::Value(value) => match &value.ty {
+                Ty::Struct(name) => {
+                    let name = name.clone();
+                    let (idx, field_ty) = self.structs[&name].field(field);
+                    let extracted = self
+                        .builder
+                        .build_extract_value(value.value.into_struct_value(), idx, field)
+                        .map_err(|e| CodegenError {
+                            message: format!("failed to extract field `{field}`: {e}"),
+                        })?;
+                    Ok(Operand::Value(CVal {
+                        value: extracted,
+                        ty: field_ty.clone(),
+                    }))
                 }
+                Ty::Ptr(_) => {
+                    let (ptr, name) = self.peel_value_to_struct(value)?;
+                    Ok(Operand::Place(self.field_place(ptr, &name, field)?))
+                }
+                Ty::I32 | Ty::Bool => unreachable!("typeck"),
+            },
+        }
+    }
+
+    fn field_place(
+        &self,
+        struct_ptr: PointerValue<'ctx>,
+        struct_name: &str,
+        field: &str,
+    ) -> Result<Place<'ctx>, CodegenError> {
+        let info = &self.structs[struct_name];
+        let (idx, field_ty) = info.field(field);
+        let ptr = self
+            .builder
+            .build_struct_gep(info.ty, struct_ptr, idx, field)
+            .map_err(|e| CodegenError {
+                message: format!("failed to gep field `{field}`: {e}"),
+            })?;
+        Ok(Place {
+            ptr,
+            ty: field_ty.clone(),
+        })
+    }
+
+    fn peel_place_to_struct(
+        &self,
+        mut place: Place<'ctx>,
+    ) -> Result<(PointerValue<'ctx>, String), CodegenError> {
+        loop {
+            match place.ty {
+                Ty::Struct(name) => return Ok((place.ptr, name)),
+                Ty::Ptr(inner) => {
+                    let loaded = self
+                        .builder
+                        .build_load(self.ptr_ty(), place.ptr, "ldptr")
+                        .map_err(|e| CodegenError {
+                            message: format!("failed to load pointer: {e}"),
+                        })?;
+                    place = Place {
+                        ptr: loaded.into_pointer_value(),
+                        ty: *inner,
+                    };
+                }
+                Ty::I32 | Ty::Bool => unreachable!("typeck"),
+            }
+        }
+    }
+
+    fn peel_value_to_struct(
+        &self,
+        mut value: CVal<'ctx>,
+    ) -> Result<(PointerValue<'ctx>, String), CodegenError> {
+        loop {
+            match value.ty {
+                Ty::Ptr(inner) => match *inner {
+                    Ty::Struct(name) => return Ok((value.value.into_pointer_value(), name)),
+                    other => {
+                        let loaded = self
+                            .builder
+                            .build_load(self.ptr_ty(), value.value.into_pointer_value(), "ldptr")
+                            .map_err(|e| CodegenError {
+                                message: format!("failed to load pointer: {e}"),
+                            })?;
+                        value = CVal {
+                            value: loaded,
+                            ty: other,
+                        };
+                    }
+                },
+                Ty::I32 | Ty::Bool | Ty::Struct(_) => unreachable!("typeck"),
             }
         }
     }
@@ -658,7 +1012,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             _ => unreachable!("not a short-circuit op"),
         };
 
-        let lhs_val = self.codegen_expr(lhs)?;
+        let lhs_val = self.codegen_expr(lhs)?.int();
         let rhs_bb = self
             .context
             .append_basic_block(self.llvm_fn, &format!("{prefix}.rhs"));
@@ -681,7 +1035,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             })?;
 
         self.builder.position_at_end(rhs_bb);
-        let rhs_val = self.codegen_expr(rhs)?;
+        let rhs_val = self.codegen_expr(rhs)?.int();
         let rhs_end = self.builder.get_insert_block().unwrap_or(rhs_bb);
         self.builder
             .build_unconditional_branch(merge_bb)
@@ -712,10 +1066,16 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
     }
 }
 
-fn llvm_int_ty<'ctx>(context: &'ctx Context, ty: Ty) -> inkwell::types::IntType<'ctx> {
+fn llvm_ty<'ctx>(
+    context: &'ctx Context,
+    structs: &HashMap<String, LlvmStruct<'ctx>>,
+    ty: &Ty,
+) -> BasicTypeEnum<'ctx> {
     match ty {
-        Ty::I32 => context.i32_type(),
-        Ty::Bool => context.bool_type(),
+        Ty::I32 => context.i32_type().into(),
+        Ty::Bool => context.bool_type().into(),
+        Ty::Struct(name) => structs[name].ty.into(),
+        Ty::Ptr(_) => context.ptr_type(AddressSpace::default()).into(),
     }
 }
 
@@ -723,7 +1083,8 @@ fn ast_ty(ty: &Type) -> Ty {
     match ty {
         Type::Name(name) if name == "i32" => Ty::I32,
         Type::Name(name) if name == "bool" => Ty::Bool,
-        Type::Name(_) => unreachable!("typeck rejects unknown types"),
+        Type::Name(name) => Ty::Struct(name.clone()),
+        Type::Ptr(inner) => Ty::Ptr(Box::new(ast_ty(inner))),
     }
 }
 
@@ -741,20 +1102,14 @@ fn int_pred(op: BinOp) -> IntPredicate {
     }
 }
 
-fn int_value_ty<'ctx>(context: &'ctx Context, value: IntValue<'ctx>) -> Ty {
-    if value.get_type() == context.bool_type() {
-        Ty::Bool
-    } else {
-        Ty::I32
-    }
-}
-
 fn runtime_print_i32<'ctx>(
     llvm_module: &LlvmModule<'ctx>,
 ) -> Result<FunctionValue<'ctx>, CodegenError> {
-    llvm_module.get_function(PRINT_I32).ok_or_else(|| CodegenError {
-        message: format!("missing runtime declaration `{PRINT_I32}`"),
-    })
+    llvm_module
+        .get_function(PRINT_I32)
+        .ok_or_else(|| CodegenError {
+            message: format!("missing runtime declaration `{PRINT_I32}`"),
+        })
 }
 
 #[cfg(test)]
@@ -812,5 +1167,16 @@ mod tests {
         assert!(ir.contains("and.rhs"), "{ir}");
         assert!(ir.contains("and.merge"), "{ir}");
         assert!(ir.contains("phi"), "{ir}");
+    }
+
+    #[test]
+    fn emit_llvm_struct_and_pointer() {
+        let module = module_of(
+            "struct Point { x: i32, y: i32 } fn bump(p: *Point) -> i32 { p.x = p.x + 1; return p.x; } fn main() -> i32 { let p = Point { x: 1, y: 2 }; return bump(&p); }",
+        );
+        let ir = emit_llvm_ir(&module, "struct.satl").unwrap();
+        assert!(ir.contains("%Point"), "{ir}");
+        assert!(ir.contains("define i32 @bump"), "{ir}");
+        assert!(ir.contains("getelementptr"), "{ir}");
     }
 }

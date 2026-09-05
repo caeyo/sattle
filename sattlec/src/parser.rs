@@ -1,6 +1,8 @@
 //! Recursive-descent parser.
 
-use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Param, Stmt, Type, UnOp};
+use crate::ast::{
+    BinOp, Block, Expr, Field, Function, Item, Module, Param, Stmt, StructItem, Type, UnOp,
+};
 use crate::lexer::{SpannedToken, Token};
 
 /// Parse error: message and byte offset into the source.
@@ -38,10 +40,14 @@ impl<'a> Parser<'a> {
         self.tokens.get(self.pos + n).map(|t| &t.kind)
     }
 
+    fn at_struct_lit(&self) -> bool {
+        matches!(self.peek_kind(), Some(Token::LBrace))
+            && matches!(self.peek_nth_kind(1), Some(Token::Ident(_)))
+            && matches!(self.peek_nth_kind(2), Some(Token::Colon))
+    }
+
     fn current_offset(&self) -> usize {
-        self.peek()
-            .map(|t| t.span.start)
-            .unwrap_or(self.eof_offset)
+        self.peek().map(|t| t.span.start).unwrap_or(self.eof_offset)
     }
 
     fn bump(&mut self) -> Option<&'a SpannedToken<'a>> {
@@ -57,11 +63,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect(&mut self, expected: &Token<'_>, label: &str) -> Result<&'a SpannedToken<'a>, ParseError> {
+    fn expect(
+        &mut self,
+        expected: &Token<'_>,
+        label: &str,
+    ) -> Result<&'a SpannedToken<'a>, ParseError> {
         match self.peek_kind() {
-            Some(kind)
-                if std::mem::discriminant(kind) == std::mem::discriminant(expected) =>
-            {
+            Some(kind) if std::mem::discriminant(kind) == std::mem::discriminant(expected) => {
                 Ok(self.bump().unwrap())
             }
             Some(kind) => Err(self.error(format!("expected {label}, found {kind}"))),
@@ -80,9 +88,36 @@ impl<'a> Parser<'a> {
     fn parse_item(&mut self) -> Result<Item, ParseError> {
         match self.peek_kind() {
             Some(Token::Fn) => Ok(Item::Fn(self.parse_function()?)),
+            Some(Token::Struct) => Ok(Item::Struct(self.parse_struct()?)),
             Some(kind) => Err(self.error(format!("expected item, found {kind}"))),
             None => Err(self.error("expected item, found end of file")),
         }
+    }
+
+    fn parse_struct(&mut self) -> Result<StructItem, ParseError> {
+        self.expect(&Token::Struct, "`struct`")?;
+        let name = self.expect_ident("struct name")?;
+        self.expect(&Token::LBrace, "`{`")?;
+        if matches!(self.peek_kind(), Some(Token::RBrace)) {
+            return Err(self.error(format!("struct `{name}` must have at least one field")));
+        }
+        let mut fields = Vec::new();
+        loop {
+            let field_name = self.expect_ident("field name")?;
+            self.expect(&Token::Colon, "`:`")?;
+            let ty = self.parse_type()?;
+            fields.push(Field {
+                name: field_name,
+                ty,
+            });
+            if matches!(self.peek_kind(), Some(Token::Comma)) {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RBrace, "`}`")?;
+        Ok(StructItem { name, fields })
     }
 
     fn parse_function(&mut self) -> Result<Function, ParseError> {
@@ -121,6 +156,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
+        if matches!(self.peek_kind(), Some(Token::Star)) {
+            self.bump();
+            return Ok(Type::Ptr(Box::new(self.parse_type()?)));
+        }
         Ok(Type::Name(self.expect_ident("type name")?))
     }
 
@@ -164,10 +203,7 @@ impl<'a> Parser<'a> {
                 self.expect(&Token::Semi, "`;`")?;
                 Ok(Stmt::Continue)
             }
-            Some(Token::Ident(_)) if matches!(self.peek_nth_kind(1), Some(Token::Eq)) => {
-                self.parse_assign()
-            }
-            Some(kind) => Err(self.error(format!("expected statement, found {kind}"))),
+            Some(_) => self.parse_assign(),
             None => Err(self.error("expected statement, found end of file")),
         }
     }
@@ -188,11 +224,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_assign(&mut self) -> Result<Stmt, ParseError> {
-        let name = self.expect_ident("variable name")?;
+        let target = self.parse_expr()?;
         self.expect(&Token::Eq, "`=`")?;
         let value = self.parse_expr()?;
         self.expect(&Token::Semi, "`;`")?;
-        Ok(Stmt::Assign { name, value })
+        Ok(Stmt::Assign { target, value })
     }
 
     fn parse_if(&mut self) -> Result<Stmt, ParseError> {
@@ -362,8 +398,37 @@ impl<'a> Parser<'a> {
                     expr: Box::new(expr),
                 })
             }
-            _ => self.parse_operand(),
+            Some(Token::Star) => {
+                self.bump();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Unary {
+                    op: UnOp::Deref,
+                    expr: Box::new(expr),
+                })
+            }
+            Some(Token::Amp) => {
+                self.bump();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Unary {
+                    op: UnOp::AddrOf,
+                    expr: Box::new(expr),
+                })
+            }
+            _ => self.parse_postfix(),
         }
+    }
+
+    fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_operand()?;
+        while matches!(self.peek_kind(), Some(Token::Dot)) {
+            self.bump();
+            let field = self.expect_ident("field name")?;
+            expr = Expr::Field {
+                base: Box::new(expr),
+                field,
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_operand(&mut self) -> Result<Expr, ParseError> {
@@ -392,6 +457,9 @@ impl<'a> Parser<'a> {
                 if matches!(self.peek_kind(), Some(Token::LParen)) {
                     let args = self.parse_arg_list()?;
                     Ok(Expr::Call { name, args })
+                } else if self.at_struct_lit() {
+                    let fields = self.parse_struct_lit_fields()?;
+                    Ok(Expr::StructLit { name, fields })
                 } else {
                     Ok(Expr::Var(name))
                 }
@@ -405,6 +473,24 @@ impl<'a> Parser<'a> {
             Some(kind) => Err(self.error(format!("expected expression, found {kind}"))),
             None => Err(self.error("expected expression, found end of file")),
         }
+    }
+
+    fn parse_struct_lit_fields(&mut self) -> Result<Vec<(String, Expr)>, ParseError> {
+        self.expect(&Token::LBrace, "`{`")?;
+        let mut fields = Vec::new();
+        loop {
+            let name = self.expect_ident("field name")?;
+            self.expect(&Token::Colon, "`:`")?;
+            let value = self.parse_expr()?;
+            fields.push((name, value));
+            if matches!(self.peek_kind(), Some(Token::Comma)) {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RBrace, "`}`")?;
+        Ok(fields)
     }
 
     fn parse_arg_list(&mut self) -> Result<Vec<Expr>, ParseError> {
@@ -446,7 +532,7 @@ pub fn parse(tokens: &[SpannedToken<'_>], source_len: usize) -> Result<Module, P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{format_ast, BinOp, Expr, Item, Stmt, UnOp};
+    use crate::ast::{format_ast, BinOp, Expr, Function, Item, Stmt, Type, UnOp};
     use crate::lexer::lex;
 
     fn parse_src(src: &str) -> Module {
@@ -454,11 +540,22 @@ mod tests {
         parse(&tokens, src.len()).unwrap_or_else(|e| panic!("{} at {}", e.message, e.offset))
     }
 
+    fn first_fn(module: &Module) -> &Function {
+        module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn(func) => Some(func),
+                Item::Struct(_) => None,
+            })
+            .expect("function")
+    }
+
     #[test]
     fn parses_add_example() {
         let module = parse_src("fn main() -> i32 {\n    return 1 + 1;\n}\n");
         assert_eq!(module.items.len(), 1);
-        let Item::Fn(func) = &module.items[0];
+        let func = first_fn(&module);
         assert_eq!(func.name, "main");
         assert_eq!(func.return_ty, Type::Name("i32".into()));
         assert_eq!(func.body.stmts.len(), 1);
@@ -478,7 +575,7 @@ mod tests {
     #[test]
     fn addition_is_left_associative() {
         let module = parse_src("fn main() -> i32 { return 1 + 2 + 3; }");
-        let Item::Fn(func) = &module.items[0];
+        let func = first_fn(&module);
         let Stmt::Return(expr) = &func.body.stmts[0] else {
             panic!("expected return");
         };
@@ -534,7 +631,7 @@ Module
     #[test]
     fn parses_print() {
         let module = parse_src("fn main() -> i32 { print(1 + 1); return 0; }");
-        let Item::Fn(func) = &module.items[0];
+        let func = first_fn(&module);
         assert!(matches!(&func.body.stmts[0], Stmt::Print(_)));
         assert!(matches!(&func.body.stmts[1], Stmt::Return(_)));
     }
@@ -544,7 +641,7 @@ Module
         let module = parse_src(
             "fn main() -> i32 {\n    let i = 0;\n    while i < 3 { i = i + 1; }\n    if i == 3 { return 1; } else { return 0; }\n}",
         );
-        let Item::Fn(func) = &module.items[0];
+        let func = first_fn(&module);
         assert!(matches!(&func.body.stmts[0], Stmt::Let { name, .. } if name == "i"));
         assert!(matches!(&func.body.stmts[1], Stmt::While { .. }));
         assert!(matches!(&func.body.stmts[2], Stmt::If { .. }));
@@ -555,7 +652,7 @@ Module
         let module = parse_src(
             "fn main() -> i32 { for i in 0..3 { if i == 1 { continue; } break; } return 0; }",
         );
-        let Item::Fn(func) = &module.items[0];
+        let func = first_fn(&module);
         assert!(matches!(&func.body.stmts[0], Stmt::For { name, .. } if name == "i"));
         let Stmt::For { body, .. } = &func.body.stmts[0] else {
             panic!("expected for");
@@ -569,7 +666,7 @@ Module
             "fn add(a: i32, b: i32) -> i32 { return a + b; } fn main() -> i32 { return add(1, 2); }",
         );
         assert_eq!(module.items.len(), 2);
-        let Item::Fn(add) = &module.items[0];
+        let add = first_fn(&module);
         assert_eq!(add.params.len(), 2);
         assert_eq!(add.params[0].name, "a");
         assert_eq!(
@@ -583,7 +680,7 @@ Module
 
     fn return_expr(src: &str) -> Expr {
         let module = parse_src(src);
-        let Item::Fn(func) = &module.items[0];
+        let func = first_fn(&module);
         let Stmt::Return(expr) = &func.body.stmts[0] else {
             panic!("expected return");
         };
@@ -655,7 +752,7 @@ Module
 
     fn if_cond(src: &str) -> Expr {
         let module = parse_src(src);
-        let Item::Fn(func) = &module.items[0];
+        let func = first_fn(&module);
         let Stmt::If { cond, .. } = &func.body.stmts[0] else {
             panic!("expected if");
         };
@@ -690,6 +787,90 @@ Module
                 }),
                 rhs: Box::new(Expr::Bool(false)),
             }
+        );
+    }
+
+    #[test]
+    fn parses_struct_ptr_and_fields() {
+        let module = parse_src(
+            "struct Point { x: i32, y: i32 } fn bump(p: *Point) -> i32 { p.x = p.x + 1; return p.x; } fn main() -> i32 { let p = Point { x: 1, y: 2 }; return bump(&p); }",
+        );
+        assert!(matches!(&module.items[0], Item::Struct(def) if def.name == "Point"));
+        let bump = first_fn(&module);
+        assert_eq!(
+            bump.params[0].ty,
+            Type::Ptr(Box::new(Type::Name("Point".into())))
+        );
+        assert!(matches!(
+            &bump.body.stmts[0],
+            Stmt::Assign {
+                target: Expr::Field { field, .. },
+                ..
+            } if field == "x"
+        ));
+        assert_eq!(
+            return_expr("fn main() -> i32 { return Point { x: 1, y: 2 }.x; }"),
+            Expr::Field {
+                base: Box::new(Expr::StructLit {
+                    name: "Point".into(),
+                    fields: vec![("x".into(), Expr::Int(1)), ("y".into(), Expr::Int(2)),],
+                }),
+                field: "x".into(),
+            }
+        );
+        assert_eq!(
+            return_expr("fn main() -> i32 { return *p; }"),
+            Expr::Unary {
+                op: UnOp::Deref,
+                expr: Box::new(Expr::Var("p".into())),
+            }
+        );
+        assert_eq!(
+            return_expr("fn main() -> i32 { return &p; }"),
+            Expr::Unary {
+                op: UnOp::AddrOf,
+                expr: Box::new(Expr::Var("p".into())),
+            }
+        );
+    }
+
+    #[test]
+    fn if_does_not_parse_struct_lit() {
+        let module = parse_src("fn main() -> i32 { if p { return 1; } return 0; }");
+        let func = first_fn(&module);
+        let Stmt::If { cond, .. } = &func.body.stmts[0] else {
+            panic!("expected if");
+        };
+        assert_eq!(cond, &Expr::Var("p".into()));
+    }
+
+    #[test]
+    fn if_parses_struct_lit_when_fields_follow() {
+        let module =
+            parse_src("fn main() -> i32 { if Point { x: 1 }.x == 1 { return 1; } return 0; }");
+        let func = first_fn(&module);
+        let Stmt::If { cond, .. } = &func.body.stmts[0] else {
+            panic!("expected if");
+        };
+        assert!(matches!(
+            cond,
+            Expr::Binary {
+                op: BinOp::Eq,
+                lhs,
+                ..
+            } if matches!(&**lhs, Expr::Field { field, base } if field == "x" && matches!(&**base, Expr::StructLit { name, .. } if name == "Point"))
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_struct() {
+        let src = "struct Point {} fn main() -> i32 { return 0; }";
+        let tokens = lex(src).unwrap();
+        let err = parse(&tokens, src.len()).unwrap_err();
+        assert!(
+            err.message.contains("at least one field"),
+            "{}",
+            err.message
         );
     }
 }
