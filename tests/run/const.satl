@@ -1,0 +1,34 @@
+const N: i32 = 1 + 2;
+
+enum Color {
+    Red,
+    Green
+}
+
+const START: Color = Color::Red;
+
+fn add_n(x: i32) -> i32 {
+    return x + N;
+}
+
+fn main() -> i32 {
+    print(N);
+    print(add_n(10));
+    const m = 4;
+    print(m);
+    if N == 3 {
+        print(1);
+    }
+    let x = N;
+    x = x + 1;
+    print(x);
+    match START {
+        Color::Red => {
+            print(1);
+        }
+        Color::Green => {
+            print(0);
+        }
+    }
+    return 0;
+}

@@ -30,8 +30,13 @@ impl Ty {
     }
 }
 
+struct Binding {
+    ty: Ty,
+    mutable: bool,
+}
+
 struct Env {
-    scopes: Vec<HashMap<String, Ty>>,
+    scopes: Vec<HashMap<String, Binding>>,
 }
 
 impl Env {
@@ -47,23 +52,19 @@ impl Env {
         self.scopes.pop();
     }
 
-    fn declare(&mut self, name: &str, ty: Ty) -> Result<(), TypeError> {
+    fn declare(&mut self, name: &str, ty: Ty, mutable: bool) -> Result<(), TypeError> {
         let scope = self.scopes.last_mut().expect("typeck scope");
         if scope.contains_key(name) {
             return Err(TypeError {
                 message: format!("duplicate variable `{name}`"),
             });
         }
-        scope.insert(name.to_string(), ty);
+        scope.insert(name.to_string(), Binding { ty, mutable });
         Ok(())
     }
 
-    fn get(&self, name: &str) -> Option<Ty> {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name))
-            .cloned()
+    fn get(&self, name: &str) -> Option<&Binding> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name))
     }
 }
 
@@ -95,25 +96,48 @@ impl EnumDef {
     }
 }
 
+struct ConstDef {
+    ty: Ty,
+}
+
 /// Type-check a module.
 pub fn typeck(module: &Module) -> Result<(), TypeError> {
     let (structs, enums) = collect_types(module)?;
-    let fns = collect_fns(module, &structs, &enums)?;
+    let (fns, consts) = collect_values(module, &structs, &enums)?;
+
+    let mut const_checker = checker(&fns, &structs, &enums, &consts, None);
+    for item in &module.items {
+        if let Item::Const(def) = item {
+            check_const_ops(&def.value)?;
+            let ty = const_checker.check_expr(&def.value)?;
+            let expected = &consts[&def.name].ty;
+            if ty != *expected {
+                return Err(TypeError {
+                    message: format!(
+                        "const `{}` has type `{}` but initializer has type `{}`",
+                        def.name,
+                        expected.name(),
+                        ty.name()
+                    ),
+                });
+            }
+        }
+    }
+    check_const_cycles(module, &consts)?;
 
     for item in &module.items {
         match item {
             Item::Fn(func) => {
-                let mut checker = Checker {
-                    env: Env::new(),
-                    fns: &fns,
-                    structs: &structs,
-                    enums: &enums,
-                    return_ty: fns[&func.name].ret.clone(),
-                    loop_depth: 0,
-                };
-                checker.check_function(func)?;
+                let mut chk = checker(
+                    &fns,
+                    &structs,
+                    &enums,
+                    &consts,
+                    Some(fns[&func.name].ret.clone()),
+                );
+                chk.check_function(func)?;
             }
-            Item::Struct(_) | Item::Enum(_) => {}
+            Item::Struct(_) | Item::Enum(_) | Item::Const(_) => {}
         }
     }
 
@@ -157,7 +181,7 @@ fn collect_types(
                     },
                 );
             }
-            Item::Fn(_) => {}
+            Item::Fn(_) | Item::Const(_) => {}
         }
     }
 
@@ -213,6 +237,19 @@ fn check_new_type(
     Ok(())
 }
 
+fn check_new_value(
+    name: &str,
+    fns: &HashMap<String, FnSig>,
+    consts: &HashMap<String, ConstDef>,
+) -> Result<(), TypeError> {
+    if fns.contains_key(name) || consts.contains_key(name) {
+        return Err(TypeError {
+            message: format!("duplicate definition of `{name}`"),
+        });
+    }
+    Ok(())
+}
+
 fn check_finite(
     name: &str,
     structs: &HashMap<String, StructDef>,
@@ -238,28 +275,135 @@ fn check_finite(
     Ok(())
 }
 
-fn collect_fns(
+fn collect_values(
     module: &Module,
     structs: &HashMap<String, StructDef>,
     enums: &HashMap<String, EnumDef>,
-) -> Result<HashMap<String, FnSig>, TypeError> {
+) -> Result<(HashMap<String, FnSig>, HashMap<String, ConstDef>), TypeError> {
     let mut fns = HashMap::new();
+    let mut consts = HashMap::new();
     for item in &module.items {
-        if let Item::Fn(func) = item {
-            if fns.contains_key(&func.name) {
-                return Err(TypeError {
-                    message: format!("duplicate definition of `{}`", func.name),
-                });
+        match item {
+            Item::Fn(func) => {
+                check_new_value(&func.name, &fns, &consts)?;
+                let mut params = Vec::new();
+                for param in &func.params {
+                    params.push(resolve_type(&param.ty, structs, enums)?);
+                }
+                let ret = resolve_type(&func.return_ty, structs, enums)?;
+                fns.insert(func.name.clone(), FnSig { params, ret });
             }
-            let mut params = Vec::new();
-            for param in &func.params {
-                params.push(resolve_type(&param.ty, structs, enums)?);
+            Item::Const(def) => {
+                check_new_value(&def.name, &fns, &consts)?;
+                consts.insert(
+                    def.name.clone(),
+                    ConstDef {
+                        ty: resolve_type(&def.ty, structs, enums)?,
+                    },
+                );
             }
-            let ret = resolve_type(&func.return_ty, structs, enums)?;
-            fns.insert(func.name.clone(), FnSig { params, ret });
+            Item::Struct(_) | Item::Enum(_) => {}
         }
     }
-    Ok(fns)
+    Ok((fns, consts))
+}
+
+fn check_const_ops(expr: &Expr) -> Result<(), TypeError> {
+    match expr {
+        Expr::Call { name, .. } => Err(TypeError {
+            message: format!("cannot call `{name}` in a const initializer"),
+        }),
+        Expr::Unary {
+            op: UnOp::Deref, ..
+        } => Err(TypeError {
+            message: "cannot dereference in a const initializer".into(),
+        }),
+        Expr::Unary {
+            op: UnOp::AddrOf, ..
+        } => Err(TypeError {
+            message: "cannot take address in a const initializer".into(),
+        }),
+        Expr::Unary { expr, .. } | Expr::Field { base: expr, .. } => check_const_ops(expr),
+        Expr::Binary { lhs, rhs, .. } => {
+            check_const_ops(lhs)?;
+            check_const_ops(rhs)
+        }
+        Expr::StructLit { fields, .. } => {
+            for (_, value) in fields {
+                check_const_ops(value)?;
+            }
+            Ok(())
+        }
+        Expr::Int(_) | Expr::Bool(_) | Expr::Var(_) | Expr::Variant { .. } => Ok(()),
+    }
+}
+
+fn check_const_cycles(
+    module: &Module,
+    consts: &HashMap<String, ConstDef>,
+) -> Result<(), TypeError> {
+    let mut inits = HashMap::new();
+    for item in &module.items {
+        if let Item::Const(def) = item {
+            inits.insert(def.name.as_str(), &def.value);
+        }
+    }
+    let mut done = HashSet::new();
+    let mut stack = Vec::new();
+    for name in inits.keys().copied() {
+        check_const_finite(name, &inits, consts, &mut stack, &mut done)?;
+    }
+    Ok(())
+}
+
+fn check_const_finite(
+    name: &str,
+    inits: &HashMap<&str, &Expr>,
+    consts: &HashMap<String, ConstDef>,
+    stack: &mut Vec<String>,
+    done: &mut HashSet<String>,
+) -> Result<(), TypeError> {
+    if done.contains(name) {
+        return Ok(());
+    }
+    if stack.iter().any(|seen| seen == name) {
+        return Err(TypeError {
+            message: format!("recursive const `{name}`"),
+        });
+    }
+    stack.push(name.to_string());
+    let mut deps = Vec::new();
+    collect_const_refs(inits[name], consts, &mut deps);
+    for dep in &deps {
+        check_const_finite(dep, inits, consts, stack, done)?;
+    }
+    stack.pop();
+    done.insert(name.to_string());
+    Ok(())
+}
+
+fn collect_const_refs(expr: &Expr, consts: &HashMap<String, ConstDef>, deps: &mut Vec<String>) {
+    match expr {
+        Expr::Var(name) if consts.contains_key(name) => deps.push(name.clone()),
+        Expr::Var(_) | Expr::Int(_) | Expr::Bool(_) | Expr::Variant { .. } => {}
+        Expr::Unary { expr, .. } | Expr::Field { base: expr, .. } => {
+            collect_const_refs(expr, consts, deps);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_const_refs(lhs, consts, deps);
+            collect_const_refs(rhs, consts, deps);
+        }
+        Expr::StructLit { fields, .. } => {
+            for (_, value) in fields {
+                collect_const_refs(value, consts, deps);
+            }
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_const_refs(arg, consts, deps);
+            }
+        }
+    }
 }
 
 fn resolve_type(
@@ -279,13 +423,38 @@ fn resolve_type(
     }
 }
 
+struct Place {
+    ty: Ty,
+    mutable: bool,
+    addressable: bool,
+}
+
 struct Checker<'a> {
     env: Env,
     fns: &'a HashMap<String, FnSig>,
     structs: &'a HashMap<String, StructDef>,
     enums: &'a HashMap<String, EnumDef>,
-    return_ty: Ty,
+    consts: &'a HashMap<String, ConstDef>,
+    return_ty: Option<Ty>,
     loop_depth: u32,
+}
+
+fn checker<'a>(
+    fns: &'a HashMap<String, FnSig>,
+    structs: &'a HashMap<String, StructDef>,
+    enums: &'a HashMap<String, EnumDef>,
+    consts: &'a HashMap<String, ConstDef>,
+    return_ty: Option<Ty>,
+) -> Checker<'a> {
+    Checker {
+        env: Env::new(),
+        fns,
+        structs,
+        enums,
+        consts,
+        return_ty,
+        loop_depth: 0,
+    }
 }
 
 impl<'a> Checker<'a> {
@@ -295,6 +464,7 @@ impl<'a> Checker<'a> {
             self.env.declare(
                 &param.name,
                 resolve_type(&param.ty, self.structs, self.enums)?,
+                true,
             )?;
         }
         if self.check_block(&func.body)? != Flow::Return {
@@ -304,6 +474,18 @@ impl<'a> Checker<'a> {
         }
         self.env.pop();
         Ok(())
+    }
+
+    fn lookup_value(&self, name: &str) -> Result<Ty, TypeError> {
+        if let Some(binding) = self.env.get(name) {
+            return Ok(binding.ty.clone());
+        }
+        if let Some(def) = self.consts.get(name) {
+            return Ok(def.ty.clone());
+        }
+        Err(TypeError {
+            message: format!("undeclared variable `{name}`"),
+        })
     }
 
     fn resolve(&self, ty: &Type) -> Result<Ty, TypeError> {
@@ -333,16 +515,36 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_place(&mut self, expr: &Expr) -> Result<Ty, TypeError> {
+    fn check_place(&mut self, expr: &Expr) -> Result<Place, TypeError> {
         match expr {
-            Expr::Var(name) => self.env.get(name).ok_or_else(|| TypeError {
-                message: format!("undeclared variable `{name}`"),
-            }),
+            Expr::Var(name) => {
+                if let Some(binding) = self.env.get(name) {
+                    Ok(Place {
+                        ty: binding.ty.clone(),
+                        mutable: binding.mutable,
+                        addressable: true,
+                    })
+                } else if let Some(def) = self.consts.get(name) {
+                    Ok(Place {
+                        ty: def.ty.clone(),
+                        mutable: false,
+                        addressable: false,
+                    })
+                } else {
+                    Err(TypeError {
+                        message: format!("undeclared variable `{name}`"),
+                    })
+                }
+            }
             Expr::Unary {
                 op: UnOp::Deref,
                 expr,
             } => match self.check_expr(expr)? {
-                Ty::Ptr(inner) => Ok(*inner),
+                Ty::Ptr(inner) => Ok(Place {
+                    ty: *inner,
+                    mutable: true,
+                    addressable: true,
+                }),
                 ty => Err(TypeError {
                     message: format!("`*` requires a pointer, found `{}`", ty.name()),
                 }),
@@ -350,8 +552,18 @@ impl<'a> Checker<'a> {
             Expr::Field { base, field } => {
                 let base_ty = self.check_expr(base)?;
                 let field_ty = self.field_ty(&base_ty, field)?;
-                if self.check_place(base).is_ok() || matches!(base_ty, Ty::Ptr(_)) {
-                    Ok(field_ty)
+                if matches!(base_ty, Ty::Ptr(_)) {
+                    Ok(Place {
+                        ty: field_ty,
+                        mutable: true,
+                        addressable: true,
+                    })
+                } else if let Ok(base) = self.check_place(base) {
+                    Ok(Place {
+                        ty: field_ty,
+                        mutable: base.mutable,
+                        addressable: base.addressable,
+                    })
                 } else {
                     Err(TypeError {
                         message: "cannot assign to this expression".into(),
@@ -381,11 +593,12 @@ impl<'a> Checker<'a> {
         match stmt {
             Stmt::Return(expr) => {
                 let ty = self.check_expr(expr)?;
-                if ty != self.return_ty {
+                let expected = self.return_ty.as_ref().expect("function");
+                if ty != *expected {
                     return Err(TypeError {
                         message: format!(
                             "return type mismatch: expected `{}`, found `{}`",
-                            self.return_ty.name(),
+                            expected.name(),
                             ty.name()
                         ),
                     });
@@ -401,7 +614,12 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Flow::Next)
             }
-            Stmt::Let { name, ty, value } => {
+            Stmt::Let {
+                name,
+                ty,
+                value,
+                mutable,
+            } => {
                 let value_ty = self.check_expr(value)?;
                 let ty = match ty {
                     Some(ann) => {
@@ -419,18 +637,23 @@ impl<'a> Checker<'a> {
                     }
                     None => value_ty,
                 };
-                self.env.declare(name, ty)?;
+                self.env.declare(name, ty, *mutable)?;
                 Ok(Flow::Next)
             }
             Stmt::Assign { target, value } => {
-                let var_ty = self.check_place(target)?;
+                let place = self.check_place(target)?;
+                if !place.mutable {
+                    return Err(TypeError {
+                        message: "cannot assign to const".into(),
+                    });
+                }
                 let value_ty = self.check_expr(value)?;
-                if var_ty != value_ty {
+                if place.ty != value_ty {
                     return Err(TypeError {
                         message: format!(
                             "cannot assign `{}` to expression of type `{}`",
                             value_ty.name(),
-                            var_ty.name()
+                            place.ty.name()
                         ),
                     });
                 }
@@ -490,7 +713,7 @@ impl<'a> Checker<'a> {
                     });
                 }
                 self.env.push();
-                self.env.declare(name, Ty::I32)?;
+                self.env.declare(name, Ty::I32, true)?;
                 self.loop_depth += 1;
                 let _ = self.check_block(body)?;
                 self.loop_depth -= 1;
@@ -572,9 +795,7 @@ impl<'a> Checker<'a> {
                 Ok(Ty::I32)
             }
             Expr::Bool(_) => Ok(Ty::Bool),
-            Expr::Var(name) => self.env.get(name).ok_or_else(|| TypeError {
-                message: format!("undeclared variable `{name}`"),
-            }),
+            Expr::Var(name) => self.lookup_value(name),
             Expr::Call { name, args } => {
                 let Some(sig) = self.fns.get(name) else {
                     return Err(TypeError {
@@ -687,7 +908,14 @@ impl<'a> Checker<'a> {
                     }),
                 },
                 UnOp::AddrOf => match self.check_place(expr) {
-                    Ok(ty) => Ok(Ty::Ptr(Box::new(ty))),
+                    Ok(place) => {
+                        if !place.addressable {
+                            return Err(TypeError {
+                                message: "cannot take address of const".into(),
+                            });
+                        }
+                        Ok(Ty::Ptr(Box::new(place.ty)))
+                    }
                     Err(err) if err.message == "cannot assign to this expression" => {
                         Err(TypeError {
                             message: "cannot take address of this expression".into(),
@@ -1109,6 +1337,61 @@ mod tests {
     fn rejects_struct_enum_name_clash() {
         let err =
             check("struct Color { x: i32 } enum Color { Red } fn main() -> i32 { return 0; }")
+                .unwrap_err();
+        assert!(err.message.contains("duplicate"), "{}", err.message);
+    }
+
+    #[test]
+    fn accepts_item_and_local_const() {
+        assert!(check("const N: i32 = 1 + 2; fn main() -> i32 { const m = N; return m; }").is_ok());
+    }
+
+    #[test]
+    fn accepts_const_forward_ref() {
+        assert!(
+            check("const A: i32 = B; const B: i32 = 1; fn main() -> i32 { return A; }").is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_const_enum() {
+        assert!(check(
+            "enum Color { Red, Green } const START: Color = Color::Red; fn main() -> i32 { match START { Color::Red => { return 1; } Color::Green => { return 0; } } }"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_assign_to_local_const() {
+        let err = check("fn main() -> i32 { const n = 1; n = 2; return n; }").unwrap_err();
+        assert!(err.message.contains("const"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_assign_to_item_const() {
+        let err = check("const N: i32 = 1; fn main() -> i32 { N = 2; return N; }").unwrap_err();
+        assert!(err.message.contains("const"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_call_in_const() {
+        let err =
+            check("fn f() -> i32 { return 1; } const N: i32 = f(); fn main() -> i32 { return N; }")
+                .unwrap_err();
+        assert!(err.message.contains("call"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_recursive_const() {
+        let err = check("const A: i32 = B; const B: i32 = A; fn main() -> i32 { return A; }")
+            .unwrap_err();
+        assert!(err.message.contains("recursive"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_const_fn_name_clash() {
+        let err =
+            check("const N: i32 = 1; fn N() -> i32 { return 0; } fn main() -> i32 { return 0; }")
                 .unwrap_err();
         assert!(err.message.contains("duplicate"), "{}", err.message);
     }

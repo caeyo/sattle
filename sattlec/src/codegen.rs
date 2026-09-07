@@ -106,6 +106,7 @@ fn build_module<'ctx>(
     declare_runtime(context, &llvm_module);
     let builder = context.create_builder();
     let enums = collect_enums(module);
+    let consts = collect_const_inits(module);
     let structs = declare_structs(context, module, &enums);
 
     let mut functions = HashMap::new();
@@ -141,6 +142,7 @@ fn build_module<'ctx>(
                 &functions,
                 &structs,
                 &enums,
+                &consts,
                 func,
             )?;
         }
@@ -179,6 +181,16 @@ impl<'ctx> LlvmStruct<'ctx> {
 struct FnInfo<'ctx> {
     value: FunctionValue<'ctx>,
     ret: Ty,
+}
+
+fn collect_const_inits(module: &Module) -> HashMap<String, Expr> {
+    let mut consts = HashMap::new();
+    for item in &module.items {
+        if let Item::Const(def) = item {
+            consts.insert(def.name.clone(), def.value.clone());
+        }
+    }
+    consts
 }
 
 fn collect_enums(module: &Module) -> HashMap<String, Vec<String>> {
@@ -274,6 +286,7 @@ fn codegen_function<'ctx>(
     functions: &HashMap<String, FnInfo<'ctx>>,
     structs: &HashMap<String, LlvmStruct<'ctx>>,
     enums: &HashMap<String, Vec<String>>,
+    consts: &HashMap<String, Expr>,
     func: &Function,
 ) -> Result<(), CodegenError> {
     let llvm_fn = functions[&func.name].value;
@@ -287,6 +300,7 @@ fn codegen_function<'ctx>(
         functions,
         structs,
         enums,
+        consts,
         scopes: Vec::new(),
         loops: Vec::new(),
     };
@@ -349,6 +363,7 @@ struct Codegen<'ctx, 'a> {
     functions: &'a HashMap<String, FnInfo<'ctx>>,
     structs: &'a HashMap<String, LlvmStruct<'ctx>>,
     enums: &'a HashMap<String, Vec<String>>,
+    consts: &'a HashMap<String, Expr>,
     scopes: Vec<HashMap<String, Var<'ctx>>>,
     loops: Vec<Loop<'ctx>>,
 }
@@ -376,14 +391,8 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             .insert(name.to_string(), var);
     }
 
-    fn lookup(&self, name: &str) -> Result<&Var<'ctx>, CodegenError> {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name))
-            .ok_or_else(|| CodegenError {
-                message: format!("undeclared variable `{name}`"),
-            })
+    fn try_lookup(&self, name: &str) -> Option<&Var<'ctx>> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name))
     }
 
     fn ptr_ty(&self) -> inkwell::types::PointerType<'ctx> {
@@ -840,11 +849,18 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                 ty: Ty::Bool,
             })),
             Expr::Var(name) => {
-                let var = self.lookup(name)?;
-                Ok(Operand::Place(Place {
-                    ptr: var.ptr,
-                    ty: var.ty.clone(),
-                }))
+                if let Some(var) = self.try_lookup(name) {
+                    Ok(Operand::Place(Place {
+                        ptr: var.ptr,
+                        ty: var.ty.clone(),
+                    }))
+                } else if let Some(value) = self.consts.get(name) {
+                    Ok(Operand::Value(self.codegen_expr(value)?))
+                } else {
+                    Err(CodegenError {
+                        message: format!("undeclared variable `{name}`"),
+                    })
+                }
             }
             Expr::Call { name, args } => {
                 let info = &self.functions[name];
@@ -1303,5 +1319,12 @@ mod tests {
         let ir = emit_llvm_ir(&module, "enum.satl").unwrap();
         assert!(ir.contains("switch"), "{ir}");
         assert!(ir.contains("unreachable"), "{ir}");
+    }
+
+    #[test]
+    fn emit_llvm_item_const() {
+        let module = module_of("const N: i32 = 1 + 2; fn main() -> i32 { return N; }");
+        let ir = emit_llvm_ir(&module, "const.satl").unwrap();
+        assert!(ir.contains("ret i32 3"), "{ir}");
     }
 }

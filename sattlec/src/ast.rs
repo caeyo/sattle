@@ -13,6 +13,7 @@ pub enum Item {
     Fn(Function),
     Struct(StructItem),
     Enum(EnumItem),
+    Const(ConstItem),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,13 @@ pub struct StructItem {
 pub struct EnumItem {
     pub name: String,
     pub variants: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstItem {
+    pub name: String,
+    pub ty: Type,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +74,7 @@ pub enum Stmt {
         name: String,
         ty: Option<Type>,
         value: Expr,
+        mutable: bool,
     },
     Assign {
         target: Expr,
@@ -215,6 +224,7 @@ fn write_item(out: &mut String, item: &Item, depth: usize) {
         Item::Fn(func) => write_function(out, func, depth),
         Item::Struct(def) => write_struct(out, def, depth),
         Item::Enum(def) => write_enum(out, def, depth),
+        Item::Const(def) => write_const(out, def, depth),
     }
 }
 
@@ -257,6 +267,13 @@ fn write_enum(out: &mut String, def: &EnumItem, depth: usize) {
     }
 }
 
+fn write_const(out: &mut String, def: &ConstItem, depth: usize) {
+    indent(out, depth);
+    out.push_str(&format!("Const {}\n", def.name));
+    write_type(out, &def.ty, depth + 1);
+    write_expr(out, &def.value, depth + 1);
+}
+
 fn write_type(out: &mut String, ty: &Type, depth: usize) {
     indent(out, depth);
     match ty {
@@ -288,9 +305,18 @@ fn write_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             out.push_str("Print\n");
             write_expr(out, expr, depth + 1);
         }
-        Stmt::Let { name, ty, value } => {
+        Stmt::Let {
+            name,
+            ty,
+            value,
+            mutable,
+        } => {
             indent(out, depth);
-            out.push_str(&format!("Let {name}\n"));
+            if *mutable {
+                out.push_str(&format!("Let {name}\n"));
+            } else {
+                out.push_str(&format!("Const {name}\n"));
+            }
             if let Some(ty) = ty {
                 indent(out, depth + 1);
                 out.push_str("Type\n");

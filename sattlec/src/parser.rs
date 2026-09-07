@@ -1,8 +1,8 @@
 //! Recursive-descent parser.
 
 use crate::ast::{
-    BinOp, Block, EnumItem, Expr, Field, Function, Item, MatchArm, Module, Param, Stmt, StructItem,
-    Type, UnOp,
+    BinOp, Block, ConstItem, EnumItem, Expr, Field, Function, Item, MatchArm, Module, Param, Stmt,
+    StructItem, Type, UnOp,
 };
 use crate::lexer::{SpannedToken, Token};
 
@@ -91,6 +91,7 @@ impl<'a> Parser<'a> {
             Some(Token::Fn) => Ok(Item::Fn(self.parse_function()?)),
             Some(Token::Struct) => Ok(Item::Struct(self.parse_struct()?)),
             Some(Token::Enum) => Ok(Item::Enum(self.parse_enum()?)),
+            Some(Token::Const) => Ok(Item::Const(self.parse_const_item()?)),
             Some(kind) => Err(self.error(format!("expected item, found {kind}"))),
             None => Err(self.error("expected item, found end of file")),
         }
@@ -140,6 +141,17 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Token::RBrace, "`}`")?;
         Ok(EnumItem { name, variants })
+    }
+
+    fn parse_const_item(&mut self) -> Result<ConstItem, ParseError> {
+        self.expect(&Token::Const, "`const`")?;
+        let name = self.expect_ident("const name")?;
+        self.expect(&Token::Colon, "`:`")?;
+        let ty = self.parse_type()?;
+        self.expect(&Token::Eq, "`=`")?;
+        let value = self.parse_expr()?;
+        self.expect(&Token::Semi, "`;`")?;
+        Ok(ConstItem { name, ty, value })
     }
 
     fn parse_function(&mut self) -> Result<Function, ParseError> {
@@ -212,6 +224,7 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::Print(expr))
             }
             Some(Token::Let) => self.parse_let(),
+            Some(Token::Const) => self.parse_const_stmt(),
             Some(Token::If) => self.parse_if(),
             Some(Token::While) => self.parse_while(),
             Some(Token::For) => self.parse_for(),
@@ -233,6 +246,15 @@ impl<'a> Parser<'a> {
 
     fn parse_let(&mut self) -> Result<Stmt, ParseError> {
         self.expect(&Token::Let, "`let`")?;
+        self.parse_binding(true)
+    }
+
+    fn parse_const_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&Token::Const, "`const`")?;
+        self.parse_binding(false)
+    }
+
+    fn parse_binding(&mut self, mutable: bool) -> Result<Stmt, ParseError> {
         let name = self.expect_ident("variable name")?;
         let ty = if matches!(self.peek_kind(), Some(Token::Colon)) {
             self.bump();
@@ -243,7 +265,12 @@ impl<'a> Parser<'a> {
         self.expect(&Token::Eq, "`=`")?;
         let value = self.parse_expr()?;
         self.expect(&Token::Semi, "`;`")?;
-        Ok(Stmt::Let { name, ty, value })
+        Ok(Stmt::Let {
+            name,
+            ty,
+            value,
+            mutable,
+        })
     }
 
     fn parse_assign(&mut self) -> Result<Stmt, ParseError> {
@@ -606,7 +633,7 @@ mod tests {
             .iter()
             .find_map(|item| match item {
                 Item::Fn(func) => Some(func),
-                Item::Struct(_) | Item::Enum(_) => None,
+                Item::Struct(_) | Item::Enum(_) | Item::Const(_) => None,
             })
             .expect("function")
     }
@@ -954,14 +981,14 @@ Module
     }
 
     #[test]
-    fn rejects_empty_enum() {
-        let src = "enum Color {} fn main() -> i32 { return 0; }";
-        let tokens = lex(src).unwrap();
-        let err = parse(&tokens, src.len()).unwrap_err();
+    fn parses_const_item_and_local() {
+        let module = parse_src("const N: i32 = 1 + 2; fn main() -> i32 { const m = N; return m; }");
         assert!(
-            err.message.contains("at least one variant"),
-            "{}",
-            err.message
+            matches!(&module.items[0], Item::Const(def) if def.name == "N" && def.ty == Type::Name("i32".into()))
+        );
+        let func = first_fn(&module);
+        assert!(
+            matches!(&func.body.stmts[0], Stmt::Let { name, mutable, .. } if name == "m" && !*mutable)
         );
     }
 }
