@@ -1,6 +1,6 @@
 //! Type checking.
 
-use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt, Type, UnOp};
+use crate::ast::{BinOp, Block, Expr, Function, Item, MatchArm, Module, Stmt, Type, UnOp};
 use std::collections::{HashMap, HashSet};
 
 /// A type-checking error.
@@ -15,6 +15,7 @@ pub enum Ty {
     I32,
     Bool,
     Struct(String),
+    Enum(String),
     Ptr(Box<Ty>),
 }
 
@@ -23,7 +24,7 @@ impl Ty {
         match self {
             Ty::I32 => "i32".into(),
             Ty::Bool => "bool".into(),
-            Ty::Struct(name) => name.clone(),
+            Ty::Struct(name) | Ty::Enum(name) => name.clone(),
             Ty::Ptr(inner) => format!("*{}", inner.name()),
         }
     }
@@ -84,10 +85,20 @@ impl StructDef {
     }
 }
 
+struct EnumDef {
+    variants: Vec<String>,
+}
+
+impl EnumDef {
+    fn has_variant(&self, name: &str) -> bool {
+        self.variants.iter().any(|variant| variant == name)
+    }
+}
+
 /// Type-check a module.
 pub fn typeck(module: &Module) -> Result<(), TypeError> {
-    let structs = collect_structs(module)?;
-    let fns = collect_fns(module, &structs)?;
+    let (structs, enums) = collect_types(module)?;
+    let fns = collect_fns(module, &structs, &enums)?;
 
     for item in &module.items {
         match item {
@@ -96,37 +107,60 @@ pub fn typeck(module: &Module) -> Result<(), TypeError> {
                     env: Env::new(),
                     fns: &fns,
                     structs: &structs,
+                    enums: &enums,
                     return_ty: fns[&func.name].ret.clone(),
                     loop_depth: 0,
                 };
                 checker.check_function(func)?;
             }
-            Item::Struct(_) => {}
+            Item::Struct(_) | Item::Enum(_) => {}
         }
     }
 
     Ok(())
 }
 
-fn collect_structs(module: &Module) -> Result<HashMap<String, StructDef>, TypeError> {
+fn is_reserved_type(name: &str) -> bool {
+    name == "i32" || name == "bool"
+}
+
+fn collect_types(
+    module: &Module,
+) -> Result<(HashMap<String, StructDef>, HashMap<String, EnumDef>), TypeError> {
     let mut structs = HashMap::new();
+    let mut enums = HashMap::new();
     for item in &module.items {
-        if let Item::Struct(def) = item {
-            if def.name == "i32" || def.name == "bool" {
-                return Err(TypeError {
-                    message: format!("cannot define struct with reserved name `{}`", def.name),
-                });
+        match item {
+            Item::Struct(def) => {
+                check_new_type(&def.name, &structs, &enums)?;
+                structs.insert(def.name.clone(), StructDef { fields: Vec::new() });
             }
-            if structs.contains_key(&def.name) {
-                return Err(TypeError {
-                    message: format!("duplicate definition of `{}`", def.name),
-                });
+            Item::Enum(def) => {
+                check_new_type(&def.name, &structs, &enums)?;
+                let mut seen = HashSet::new();
+                for variant in &def.variants {
+                    if !seen.insert(variant.clone()) {
+                        return Err(TypeError {
+                            message: format!("duplicate variant `{variant}` on `{}`", def.name),
+                        });
+                    }
+                }
+                if def.variants.is_empty() {
+                    return Err(TypeError {
+                        message: format!("enum `{}` must have at least one variant", def.name),
+                    });
+                }
+                enums.insert(
+                    def.name.clone(),
+                    EnumDef {
+                        variants: def.variants.clone(),
+                    },
+                );
             }
-            structs.insert(def.name.clone(), StructDef { fields: Vec::new() });
+            Item::Fn(_) => {}
         }
     }
 
-    // Grab fields on second pass so that a field can name a struct that is defined later
     for item in &module.items {
         if let Item::Struct(def) = item {
             let mut fields = Vec::new();
@@ -137,7 +171,10 @@ fn collect_structs(module: &Module) -> Result<HashMap<String, StructDef>, TypeEr
                         message: format!("duplicate field `{}` on `{}`", field.name, def.name),
                     });
                 }
-                fields.push((field.name.clone(), resolve_type(&field.ty, &structs)?));
+                fields.push((
+                    field.name.clone(),
+                    resolve_type(&field.ty, &structs, &enums)?,
+                ));
             }
             if fields.is_empty() {
                 return Err(TypeError {
@@ -155,7 +192,25 @@ fn collect_structs(module: &Module) -> Result<HashMap<String, StructDef>, TypeEr
         check_finite(name, &structs, &mut stack, &mut done)?;
     }
 
-    Ok(structs)
+    Ok((structs, enums))
+}
+
+fn check_new_type(
+    name: &str,
+    structs: &HashMap<String, StructDef>,
+    enums: &HashMap<String, EnumDef>,
+) -> Result<(), TypeError> {
+    if is_reserved_type(name) {
+        return Err(TypeError {
+            message: format!("cannot define type with reserved name `{name}`"),
+        });
+    }
+    if structs.contains_key(name) || enums.contains_key(name) {
+        return Err(TypeError {
+            message: format!("duplicate definition of `{name}`"),
+        });
+    }
+    Ok(())
 }
 
 fn check_finite(
@@ -186,6 +241,7 @@ fn check_finite(
 fn collect_fns(
     module: &Module,
     structs: &HashMap<String, StructDef>,
+    enums: &HashMap<String, EnumDef>,
 ) -> Result<HashMap<String, FnSig>, TypeError> {
     let mut fns = HashMap::new();
     for item in &module.items {
@@ -197,24 +253,29 @@ fn collect_fns(
             }
             let mut params = Vec::new();
             for param in &func.params {
-                params.push(resolve_type(&param.ty, structs)?);
+                params.push(resolve_type(&param.ty, structs, enums)?);
             }
-            let ret = resolve_type(&func.return_ty, structs)?;
+            let ret = resolve_type(&func.return_ty, structs, enums)?;
             fns.insert(func.name.clone(), FnSig { params, ret });
         }
     }
     Ok(fns)
 }
 
-fn resolve_type(ty: &Type, structs: &HashMap<String, StructDef>) -> Result<Ty, TypeError> {
+fn resolve_type(
+    ty: &Type,
+    structs: &HashMap<String, StructDef>,
+    enums: &HashMap<String, EnumDef>,
+) -> Result<Ty, TypeError> {
     match ty {
         Type::Name(name) if name == "i32" => Ok(Ty::I32),
         Type::Name(name) if name == "bool" => Ok(Ty::Bool),
         Type::Name(name) if structs.contains_key(name) => Ok(Ty::Struct(name.clone())),
+        Type::Name(name) if enums.contains_key(name) => Ok(Ty::Enum(name.clone())),
         Type::Name(name) => Err(TypeError {
             message: format!("unknown type `{name}`"),
         }),
-        Type::Ptr(inner) => Ok(Ty::Ptr(Box::new(resolve_type(inner, structs)?))),
+        Type::Ptr(inner) => Ok(Ty::Ptr(Box::new(resolve_type(inner, structs, enums)?))),
     }
 }
 
@@ -222,6 +283,7 @@ struct Checker<'a> {
     env: Env,
     fns: &'a HashMap<String, FnSig>,
     structs: &'a HashMap<String, StructDef>,
+    enums: &'a HashMap<String, EnumDef>,
     return_ty: Ty,
     loop_depth: u32,
 }
@@ -230,8 +292,10 @@ impl<'a> Checker<'a> {
     fn check_function(&mut self, func: &Function) -> Result<(), TypeError> {
         self.env.push();
         for param in &func.params {
-            self.env
-                .declare(&param.name, resolve_type(&param.ty, self.structs)?)?;
+            self.env.declare(
+                &param.name,
+                resolve_type(&param.ty, self.structs, self.enums)?,
+            )?;
         }
         if self.check_block(&func.body)? != Flow::Return {
             return Err(TypeError {
@@ -243,7 +307,7 @@ impl<'a> Checker<'a> {
     }
 
     fn resolve(&self, ty: &Type) -> Result<Ty, TypeError> {
-        resolve_type(ty, self.structs)
+        resolve_type(ty, self.structs, self.enums)
     }
 
     fn field_ty(&self, base_ty: &Ty, field: &str) -> Result<Ty, TypeError> {
@@ -449,7 +513,52 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Flow::Jump)
             }
+            Stmt::Match { scrutinee, arms } => self.check_match(scrutinee, arms),
         }
+    }
+
+    fn check_match(&mut self, scrutinee: &Expr, arms: &[MatchArm]) -> Result<Flow, TypeError> {
+        let scrut_ty = self.check_expr(scrutinee)?;
+        let enum_name = enum_of(&scrut_ty)?;
+        let variants = self.enums[enum_name].variants.clone();
+        let mut seen = HashSet::new();
+        let mut flows = Vec::new();
+        for arm in arms {
+            if arm.enum_name != enum_name {
+                return Err(TypeError {
+                    message: format!(
+                        "pattern `{}::{}` does not match `{enum_name}`",
+                        arm.enum_name, arm.variant
+                    ),
+                });
+            }
+            if !variants.iter().any(|variant| variant == &arm.variant) {
+                return Err(TypeError {
+                    message: format!("no variant `{}` on `{enum_name}`", arm.variant),
+                });
+            }
+            if !seen.insert(arm.variant.clone()) {
+                return Err(TypeError {
+                    message: format!("duplicate match arm `{enum_name}::{}`", arm.variant),
+                });
+            }
+            flows.push(self.check_block(&arm.body)?);
+        }
+        let missing: Vec<&String> = variants
+            .iter()
+            .filter(|variant| !seen.contains(*variant))
+            .collect();
+        if !missing.is_empty() {
+            let list = missing
+                .iter()
+                .map(|variant| format!("`{enum_name}::{variant}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(TypeError {
+                message: format!("non-exhaustive match on `{enum_name}`: missing {list}"),
+            });
+        }
+        Ok(join_match(&flows))
     }
 
     fn check_expr(&mut self, expr: &Expr) -> Result<Ty, TypeError> {
@@ -535,6 +644,19 @@ impl<'a> Checker<'a> {
                 }
                 Ok(Ty::Struct(name.clone()))
             }
+            Expr::Variant { enum_name, variant } => {
+                let Some(def) = self.enums.get(enum_name) else {
+                    return Err(TypeError {
+                        message: format!("unknown enum `{enum_name}`"),
+                    });
+                };
+                if !def.has_variant(variant) {
+                    return Err(TypeError {
+                        message: format!("no variant `{variant}` on `{enum_name}`"),
+                    });
+                }
+                Ok(Ty::Enum(enum_name.clone()))
+            }
             Expr::Field { base, field } => {
                 let base_ty = self.check_expr(base)?;
                 self.field_ty(&base_ty, field)
@@ -600,7 +722,7 @@ impl<'a> Checker<'a> {
                                 ),
                             });
                         }
-                        if !matches!(lhs_ty, Ty::I32 | Ty::Bool) {
+                        if !matches!(lhs_ty, Ty::I32 | Ty::Bool | Ty::Enum(_)) {
                             return Err(TypeError {
                                 message: format!("cannot compare `{}`", lhs_ty.name()),
                             });
@@ -652,6 +774,31 @@ fn join_if(then: Flow, else_: Option<Flow>) -> Flow {
             (Flow::Next, _) | (_, Flow::Next) => Flow::Next,
             _ => Flow::Jump,
         },
+    }
+}
+
+fn join_match(flows: &[Flow]) -> Flow {
+    if flows.iter().all(|flow| *flow == Flow::Return) {
+        Flow::Return
+    } else if flows.iter().any(|flow| *flow == Flow::Next) {
+        Flow::Next
+    } else {
+        Flow::Jump
+    }
+}
+
+fn enum_of(ty: &Ty) -> Result<&str, TypeError> {
+    let mut cur = ty;
+    loop {
+        match cur {
+            Ty::Enum(name) => return Ok(name),
+            Ty::Ptr(inner) => cur = inner,
+            _ => {
+                return Err(TypeError {
+                    message: format!("`match` requires an enum, found `{}`", ty.name()),
+                });
+            }
+        }
     }
 }
 
@@ -898,5 +1045,71 @@ mod tests {
             check("struct Point { x: i32 } fn main() -> i32 { Point { x: 1 }.x = 2; return 0; }")
                 .unwrap_err();
         assert!(err.message.contains("assign"), "{}", err.message);
+    }
+
+    #[test]
+    fn accepts_enum_and_match() {
+        assert!(check(
+            "enum Color { Red, Green } fn main() -> i32 { match Color::Red { Color::Red => { return 1; } Color::Green => { return 2; } } }"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn accepts_match_on_enum_ptr() {
+        assert!(check(
+            "enum Color { Red, Green } fn main() -> i32 { let c = Color::Red; let p: *Color = &c; match p { Color::Red => { return 1; } Color::Green => { return 0; } } }"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn accepts_enum_compare() {
+        assert!(check(
+            "enum Color { Red, Green } fn main() -> i32 { if Color::Red == Color::Green { return 1; } return 0; }"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_non_exhaustive_match() {
+        let err = check(
+            "enum Color { Red, Green } fn main() -> i32 { match Color::Red { Color::Red => { return 1; } } }",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("non-exhaustive"), "{}", err.message);
+        assert!(err.message.contains("Green"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_unknown_variant() {
+        let err = check("enum Color { Red } fn main() -> i32 { return Color::Blue; }").unwrap_err();
+        assert!(err.message.contains("no variant"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_duplicate_match_arm() {
+        let err = check(
+            "enum Color { Red, Green } fn main() -> i32 { match Color::Red { Color::Red => { return 1; } Color::Red => { return 2; } Color::Green => { return 3; } } }",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("duplicate"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_match_missing_return() {
+        let err = check(
+            "enum Color { Red, Green } fn main() -> i32 { match Color::Red { Color::Red => { return 1; } Color::Green => { } } }",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("missing `return`"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_struct_enum_name_clash() {
+        let err =
+            check("struct Color { x: i32 } enum Color { Red } fn main() -> i32 { return 0; }")
+                .unwrap_err();
+        assert!(err.message.contains("duplicate"), "{}", err.message);
     }
 }

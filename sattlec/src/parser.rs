@@ -1,7 +1,8 @@
 //! Recursive-descent parser.
 
 use crate::ast::{
-    BinOp, Block, Expr, Field, Function, Item, Module, Param, Stmt, StructItem, Type, UnOp,
+    BinOp, Block, EnumItem, Expr, Field, Function, Item, MatchArm, Module, Param, Stmt, StructItem,
+    Type, UnOp,
 };
 use crate::lexer::{SpannedToken, Token};
 
@@ -89,6 +90,7 @@ impl<'a> Parser<'a> {
         match self.peek_kind() {
             Some(Token::Fn) => Ok(Item::Fn(self.parse_function()?)),
             Some(Token::Struct) => Ok(Item::Struct(self.parse_struct()?)),
+            Some(Token::Enum) => Ok(Item::Enum(self.parse_enum()?)),
             Some(kind) => Err(self.error(format!("expected item, found {kind}"))),
             None => Err(self.error("expected item, found end of file")),
         }
@@ -118,6 +120,26 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Token::RBrace, "`}`")?;
         Ok(StructItem { name, fields })
+    }
+
+    fn parse_enum(&mut self) -> Result<EnumItem, ParseError> {
+        self.expect(&Token::Enum, "`enum`")?;
+        let name = self.expect_ident("enum name")?;
+        self.expect(&Token::LBrace, "`{`")?;
+        if matches!(self.peek_kind(), Some(Token::RBrace)) {
+            return Err(self.error(format!("enum `{name}` must have at least one variant")));
+        }
+        let mut variants = Vec::new();
+        loop {
+            variants.push(self.expect_ident("variant name")?);
+            if matches!(self.peek_kind(), Some(Token::Comma)) {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RBrace, "`}`")?;
+        Ok(EnumItem { name, variants })
     }
 
     fn parse_function(&mut self) -> Result<Function, ParseError> {
@@ -193,6 +215,7 @@ impl<'a> Parser<'a> {
             Some(Token::If) => self.parse_if(),
             Some(Token::While) => self.parse_while(),
             Some(Token::For) => self.parse_for(),
+            Some(Token::Match) => self.parse_match(),
             Some(Token::Break) => {
                 self.bump();
                 self.expect(&Token::Semi, "`;`")?;
@@ -275,6 +298,36 @@ impl<'a> Parser<'a> {
             end,
             body,
         })
+    }
+
+    fn parse_match(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&Token::Match, "`match`")?;
+        let scrutinee = self.parse_expr()?;
+        self.expect(&Token::LBrace, "`{`")?;
+        if matches!(self.peek_kind(), Some(Token::RBrace)) {
+            return Err(self.error("`match` must have at least one arm"));
+        }
+        let mut arms = Vec::new();
+        loop {
+            let enum_name = self.expect_ident("enum name")?;
+            self.expect(&Token::PathSep, "`::`")?;
+            let variant = self.expect_ident("variant name")?;
+            self.expect(&Token::FatArrow, "`=>`")?;
+            let body = self.parse_block()?;
+            arms.push(MatchArm {
+                enum_name,
+                variant,
+                body,
+            });
+            if matches!(self.peek_kind(), Some(Token::Comma)) {
+                self.bump();
+            }
+            if matches!(self.peek_kind(), Some(Token::RBrace) | None) {
+                break;
+            }
+        }
+        self.expect(&Token::RBrace, "`}`")?;
+        Ok(Stmt::Match { scrutinee, arms })
     }
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
@@ -457,6 +510,13 @@ impl<'a> Parser<'a> {
                 if matches!(self.peek_kind(), Some(Token::LParen)) {
                     let args = self.parse_arg_list()?;
                     Ok(Expr::Call { name, args })
+                } else if matches!(self.peek_kind(), Some(Token::PathSep)) {
+                    self.bump();
+                    let variant = self.expect_ident("variant name")?;
+                    Ok(Expr::Variant {
+                        enum_name: name,
+                        variant,
+                    })
                 } else if self.at_struct_lit() {
                     let fields = self.parse_struct_lit_fields()?;
                     Ok(Expr::StructLit { name, fields })
@@ -546,7 +606,7 @@ mod tests {
             .iter()
             .find_map(|item| match item {
                 Item::Fn(func) => Some(func),
-                Item::Struct(_) => None,
+                Item::Struct(_) | Item::Enum(_) => None,
             })
             .expect("function")
     }
@@ -869,6 +929,37 @@ Module
         let err = parse(&tokens, src.len()).unwrap_err();
         assert!(
             err.message.contains("at least one field"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parses_enum_and_match() {
+        let module = parse_src(
+            "enum Color { Red, Green } fn main() -> i32 { match Color::Red { Color::Red => { return 1; } Color::Green => { return 2; } } }",
+        );
+        assert!(
+            matches!(&module.items[0], Item::Enum(def) if def.name == "Color" && def.variants.len() == 2)
+        );
+        assert_eq!(
+            return_expr("fn main() -> i32 { return Color::Green; }"),
+            Expr::Variant {
+                enum_name: "Color".into(),
+                variant: "Green".into(),
+            }
+        );
+        let func = first_fn(&module);
+        assert!(matches!(&func.body.stmts[0], Stmt::Match { arms, .. } if arms.len() == 2));
+    }
+
+    #[test]
+    fn rejects_empty_enum() {
+        let src = "enum Color {} fn main() -> i32 { return 0; }";
+        let tokens = lex(src).unwrap();
+        let err = parse(&tokens, src.len()).unwrap_err();
+        assert!(
+            err.message.contains("at least one variant"),
             "{}",
             err.message
         );

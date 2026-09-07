@@ -1,6 +1,6 @@
 //! LLVM code generation via inkwell.
 
-use crate::ast::{BinOp, Block, Expr, Function, Item, Module, Stmt, Type, UnOp};
+use crate::ast::{BinOp, Block, Expr, Function, Item, MatchArm, Module, Stmt, Type, UnOp};
 use crate::typeck::Ty;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
@@ -105,7 +105,8 @@ fn build_module<'ctx>(
     llvm_module.set_source_file_name(source_name);
     declare_runtime(context, &llvm_module);
     let builder = context.create_builder();
-    let structs = declare_structs(context, module);
+    let enums = collect_enums(module);
+    let structs = declare_structs(context, module, &enums);
 
     let mut functions = HashMap::new();
     let mut saw_main = false;
@@ -114,12 +115,12 @@ fn build_module<'ctx>(
             if func.name == "main" {
                 saw_main = true;
             }
-            let llvm_fn = declare_function(context, &llvm_module, &structs, func);
+            let llvm_fn = declare_function(context, &llvm_module, &structs, &enums, func);
             functions.insert(
                 func.name.clone(),
                 FnInfo {
                     value: llvm_fn,
-                    ret: ast_ty(&func.return_ty),
+                    ret: ast_ty(&func.return_ty, &enums),
                 },
             );
         }
@@ -133,7 +134,15 @@ fn build_module<'ctx>(
 
     for item in &module.items {
         if let Item::Fn(func) = item {
-            codegen_function(context, &llvm_module, &builder, &functions, &structs, func)?;
+            codegen_function(
+                context,
+                &llvm_module,
+                &builder,
+                &functions,
+                &structs,
+                &enums,
+                func,
+            )?;
         }
     }
 
@@ -172,9 +181,20 @@ struct FnInfo<'ctx> {
     ret: Ty,
 }
 
+fn collect_enums(module: &Module) -> HashMap<String, Vec<String>> {
+    let mut enums = HashMap::new();
+    for item in &module.items {
+        if let Item::Enum(def) = item {
+            enums.insert(def.name.clone(), def.variants.clone());
+        }
+    }
+    enums
+}
+
 fn declare_structs<'ctx>(
     context: &'ctx Context,
     module: &Module,
+    enums: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, LlvmStruct<'ctx>> {
     let mut structs = HashMap::new();
     for item in &module.items {
@@ -182,7 +202,7 @@ fn declare_structs<'ctx>(
             let fields = def
                 .fields
                 .iter()
-                .map(|field| (field.name.clone(), ast_ty(&field.ty)))
+                .map(|field| (field.name.clone(), ast_ty(&field.ty, enums)))
                 .collect();
             structs.insert(
                 def.name.clone(),
@@ -227,13 +247,14 @@ fn declare_function<'ctx>(
     context: &'ctx Context,
     llvm_module: &LlvmModule<'ctx>,
     structs: &HashMap<String, LlvmStruct<'ctx>>,
+    enums: &HashMap<String, Vec<String>>,
     func: &Function,
 ) -> FunctionValue<'ctx> {
-    let ret = ast_ty(&func.return_ty);
+    let ret = ast_ty(&func.return_ty, enums);
     let params: Vec<BasicMetadataTypeEnum> = func
         .params
         .iter()
-        .map(|param| llvm_ty(context, structs, &ast_ty(&param.ty)).into())
+        .map(|param| llvm_ty(context, structs, &ast_ty(&param.ty, enums)).into())
         .collect();
     let fn_ty = llvm_ty(context, structs, &ret).fn_type(&params, false);
     let llvm_fn = llvm_module.add_function(&func.name, fn_ty, None);
@@ -252,6 +273,7 @@ fn codegen_function<'ctx>(
     builder: &Builder<'ctx>,
     functions: &HashMap<String, FnInfo<'ctx>>,
     structs: &HashMap<String, LlvmStruct<'ctx>>,
+    enums: &HashMap<String, Vec<String>>,
     func: &Function,
 ) -> Result<(), CodegenError> {
     let llvm_fn = functions[&func.name].value;
@@ -264,12 +286,13 @@ fn codegen_function<'ctx>(
         llvm_fn,
         functions,
         structs,
+        enums,
         scopes: Vec::new(),
         loops: Vec::new(),
     };
     cg.push_scope();
     for (i, param) in func.params.iter().enumerate() {
-        let ty = ast_ty(&param.ty);
+        let ty = ast_ty(&param.ty, enums);
         let val = llvm_fn.get_nth_param(i as u32).unwrap();
         let ptr = cg.alloca(&ty, &param.name)?;
         cg.builder.build_store(ptr, val).map_err(|e| CodegenError {
@@ -325,6 +348,7 @@ struct Codegen<'ctx, 'a> {
     llvm_fn: FunctionValue<'ctx>,
     functions: &'a HashMap<String, FnInfo<'ctx>>,
     structs: &'a HashMap<String, LlvmStruct<'ctx>>,
+    enums: &'a HashMap<String, Vec<String>>,
     scopes: Vec<HashMap<String, Var<'ctx>>>,
     loops: Vec<Loop<'ctx>>,
 }
@@ -478,7 +502,93 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             } => self.codegen_for(name, start, end, body),
             Stmt::Break => self.codegen_loop_jump(true),
             Stmt::Continue => self.codegen_loop_jump(false),
+            Stmt::Match { scrutinee, arms } => self.codegen_match(scrutinee, arms),
         }
+    }
+
+    fn codegen_match(&mut self, scrutinee: &Expr, arms: &[MatchArm]) -> Result<(), CodegenError> {
+        let tag = self.enum_tag(scrutinee)?;
+        let default_bb = self
+            .context
+            .append_basic_block(self.llvm_fn, "match.default");
+        let mut cases = Vec::new();
+        let mut arm_bbs = Vec::new();
+        for arm in arms {
+            let bb = self
+                .context
+                .append_basic_block(self.llvm_fn, &format!("match.{}", arm.variant));
+            cases.push((self.variant_const(&arm.enum_name, &arm.variant), bb));
+            arm_bbs.push(bb);
+        }
+        self.builder
+            .build_switch(tag, default_bb, &cases)
+            .map_err(|e| CodegenError {
+                message: format!("failed to build match: {e}"),
+            })?;
+
+        let mut merge_from = Vec::new();
+        for (arm, bb) in arms.iter().zip(arm_bbs) {
+            self.builder.position_at_end(bb);
+            self.codegen_block(&arm.body)?;
+            if !self.terminated() {
+                merge_from.push(self.builder.get_insert_block().unwrap_or(bb));
+            }
+        }
+
+        self.builder.position_at_end(default_bb);
+        self.builder.build_unreachable().map_err(|e| CodegenError {
+            message: format!("failed to close match: {e}"),
+        })?;
+
+        if merge_from.is_empty() {
+            return Ok(());
+        }
+
+        let merge = self.context.append_basic_block(self.llvm_fn, "match.merge");
+        for end in merge_from {
+            self.builder.position_at_end(end);
+            self.builder
+                .build_unconditional_branch(merge)
+                .map_err(|e| CodegenError {
+                    message: format!("failed to leave match arm: {e}"),
+                })?;
+        }
+        self.builder.position_at_end(merge);
+        Ok(())
+    }
+
+    fn enum_tag(&self, scrutinee: &Expr) -> Result<IntValue<'ctx>, CodegenError> {
+        let mut value = self.codegen_expr(scrutinee)?;
+        loop {
+            match value.ty {
+                Ty::Enum(_) => return Ok(value.int()),
+                Ty::Ptr(inner) => {
+                    let loaded = self
+                        .builder
+                        .build_load(
+                            self.llvm_ty(&inner),
+                            value.value.into_pointer_value(),
+                            "match.ld",
+                        )
+                        .map_err(|e| CodegenError {
+                            message: format!("failed to load match scrutinee: {e}"),
+                        })?;
+                    value = CVal {
+                        value: loaded,
+                        ty: *inner,
+                    };
+                }
+                Ty::I32 | Ty::Bool | Ty::Struct(_) => unreachable!("typeck"),
+            }
+        }
+    }
+
+    fn variant_const(&self, enum_name: &str, variant: &str) -> IntValue<'ctx> {
+        let idx = self.enums[enum_name]
+            .iter()
+            .position(|name| name == variant)
+            .expect("typeck");
+        self.context.i32_type().const_int(idx as u64, true)
     }
 
     fn codegen_if(
@@ -756,6 +866,10 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
             Expr::StructLit { name, fields } => {
                 Ok(Operand::Value(self.codegen_struct_lit(name, fields)?))
             }
+            Expr::Variant { enum_name, variant } => Ok(Operand::Value(CVal {
+                value: self.variant_const(enum_name, variant).into(),
+                ty: Ty::Enum(enum_name.clone()),
+            })),
             Expr::Field { base, field } => self.codegen_field(base, field),
             Expr::Unary { op, expr } => match op {
                 UnOp::Neg => {
@@ -925,7 +1039,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                     let (ptr, name) = self.peel_value_to_struct(value)?;
                     Ok(Operand::Place(self.field_place(ptr, &name, field)?))
                 }
-                Ty::I32 | Ty::Bool => unreachable!("typeck"),
+                Ty::I32 | Ty::Bool | Ty::Enum(_) => unreachable!("typeck"),
             },
         }
     }
@@ -969,7 +1083,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         ty: *inner,
                     };
                 }
-                Ty::I32 | Ty::Bool => unreachable!("typeck"),
+                Ty::I32 | Ty::Bool | Ty::Enum(_) => unreachable!("typeck"),
             }
         }
     }
@@ -995,7 +1109,7 @@ impl<'ctx, 'a> Codegen<'ctx, 'a> {
                         };
                     }
                 },
-                Ty::I32 | Ty::Bool | Ty::Struct(_) => unreachable!("typeck"),
+                Ty::I32 | Ty::Bool | Ty::Enum(_) | Ty::Struct(_) => unreachable!("typeck"),
             }
         }
     }
@@ -1072,19 +1186,20 @@ fn llvm_ty<'ctx>(
     ty: &Ty,
 ) -> BasicTypeEnum<'ctx> {
     match ty {
-        Ty::I32 => context.i32_type().into(),
+        Ty::I32 | Ty::Enum(_) => context.i32_type().into(),
         Ty::Bool => context.bool_type().into(),
         Ty::Struct(name) => structs[name].ty.into(),
         Ty::Ptr(_) => context.ptr_type(AddressSpace::default()).into(),
     }
 }
 
-fn ast_ty(ty: &Type) -> Ty {
+fn ast_ty(ty: &Type, enums: &HashMap<String, Vec<String>>) -> Ty {
     match ty {
         Type::Name(name) if name == "i32" => Ty::I32,
         Type::Name(name) if name == "bool" => Ty::Bool,
+        Type::Name(name) if enums.contains_key(name) => Ty::Enum(name.clone()),
         Type::Name(name) => Ty::Struct(name.clone()),
-        Type::Ptr(inner) => Ty::Ptr(Box::new(ast_ty(inner))),
+        Type::Ptr(inner) => Ty::Ptr(Box::new(ast_ty(inner, enums))),
     }
 }
 
@@ -1178,5 +1293,15 @@ mod tests {
         assert!(ir.contains("%Point"), "{ir}");
         assert!(ir.contains("define i32 @bump"), "{ir}");
         assert!(ir.contains("getelementptr"), "{ir}");
+    }
+
+    #[test]
+    fn emit_llvm_enum_switch() {
+        let module = module_of(
+            "enum Color { Red, Green } fn main() -> i32 { match Color::Red { Color::Red => { return 1; } Color::Green => { return 2; } } }",
+        );
+        let ir = emit_llvm_ir(&module, "enum.satl").unwrap();
+        assert!(ir.contains("switch"), "{ir}");
+        assert!(ir.contains("unreachable"), "{ir}");
     }
 }

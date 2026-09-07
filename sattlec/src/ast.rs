@@ -12,6 +12,7 @@ pub struct Module {
 pub enum Item {
     Fn(Function),
     Struct(StructItem),
+    Enum(EnumItem),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,12 @@ pub struct Function {
 pub struct StructItem {
     pub name: String,
     pub fields: Vec<Field>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumItem {
+    pub name: String,
+    pub variants: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +88,17 @@ pub enum Stmt {
     },
     Break,
     Continue,
+    Match {
+        scrutinee: Expr,
+        arms: Vec<MatchArm>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchArm {
+    pub enum_name: String,
+    pub variant: String,
+    pub body: Block,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +113,10 @@ pub enum Expr {
     StructLit {
         name: String,
         fields: Vec<(String, Expr)>,
+    },
+    Variant {
+        enum_name: String,
+        variant: String,
     },
     Field {
         base: Box<Expr>,
@@ -192,6 +214,7 @@ fn write_item(out: &mut String, item: &Item, depth: usize) {
     match item {
         Item::Fn(func) => write_function(out, func, depth),
         Item::Struct(def) => write_struct(out, def, depth),
+        Item::Enum(def) => write_enum(out, def, depth),
     }
 }
 
@@ -222,6 +245,15 @@ fn write_struct(out: &mut String, def: &StructItem, depth: usize) {
         indent(out, depth + 1);
         out.push_str(&format!("Field {}\n", field.name));
         write_type(out, &field.ty, depth + 2);
+    }
+}
+
+fn write_enum(out: &mut String, def: &EnumItem, depth: usize) {
+    indent(out, depth);
+    out.push_str(&format!("Enum {}\n", def.name));
+    for variant in &def.variants {
+        indent(out, depth + 1);
+        out.push_str(&format!("Variant {variant}\n"));
     }
 }
 
@@ -327,6 +359,18 @@ fn write_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             indent(out, depth);
             out.push_str("Continue\n");
         }
+        Stmt::Match { scrutinee, arms } => {
+            indent(out, depth);
+            out.push_str("Match\n");
+            indent(out, depth + 1);
+            out.push_str("Scrutinee\n");
+            write_expr(out, scrutinee, depth + 2);
+            for arm in arms {
+                indent(out, depth + 1);
+                out.push_str(&format!("Arm {}::{}\n", arm.enum_name, arm.variant));
+                write_block(out, &arm.body, depth + 2);
+            }
+        }
     }
 }
 
@@ -349,6 +393,9 @@ fn write_expr(out: &mut String, expr: &Expr, depth: usize) {
                 out.push_str(&format!("Field {field}\n"));
                 write_expr(out, value, depth + 2);
             }
+        }
+        Expr::Variant { enum_name, variant } => {
+            out.push_str(&format!("Variant {enum_name}::{variant}\n"));
         }
         Expr::Field { base, field } => {
             out.push_str(&format!("Field {field}\n"));
